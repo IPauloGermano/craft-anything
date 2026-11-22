@@ -91,6 +91,13 @@ impl Worker {
                         self.step(ws, Step::Study, Status::Inspecting, &format!("Couldn't open its menus and pop-ups at {width} px: {}", e.message))?;
                     }
                 }
+                // Sequential scroll and hover motion burst frames + CLS/Long-Task/frame-pacing telemetry.
+                self.step(ws, Step::Study, Status::Inspecting, "Recording scroll and hover motion telemetry…")?;
+                let motion_width = widths.first().copied().unwrap_or(1440);
+                let motion_dir = capture.join(kinds::website::MOTION_DIR);
+                if let Err(e) = self.call("web_page_motion_capture", json!({"output_directory": motion_dir.display().to_string(), "width": motion_width})) {
+                    self.step(ws, Step::Study, Status::Inspecting, &format!("Couldn't record motion telemetry at {motion_width} px: {}", e.message))?;
+                }
                 self.capture_routes(ws, &url, &widths)?;
                 if deep {
                     self.how_it_works(ws, &url)?;
