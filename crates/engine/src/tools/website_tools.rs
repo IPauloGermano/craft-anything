@@ -1347,6 +1347,10 @@ fn web_pixel_diff_heatmap(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput
     if !threshold.is_finite() || !(0.5..=50.0).contains(&threshold) {
         return Err(ToolError::invalid("delta_e_threshold must be 0.5..=50.0"));
     }
+    let out_check = abs_path(&p.output_directory, "output_directory")?;
+    if out_check.exists() {
+        return Err(ToolError::invalid(format!("output_directory already exists: {}", out_check.display())));
+    }
     let orig_path = abs_path(&p.original_image_path, "original_image_path")?;
     let built_path = abs_path(&p.built_image_path, "built_image_path")?;
     let orig_bytes = read_capped(&orig_path, web_common::MAX_SCREENSHOT_BYTES as u64)?;
@@ -1356,11 +1360,21 @@ fn web_pixel_diff_heatmap(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput
 
     let opts = web_common::DiffOptions { delta_e_threshold: threshold, ..web_common::DiffOptions::default() };
     let report = web_common::compute_pixel_diff_heatmap(&orig_img, &built_img, opts)?;
+    let diff_bytes = serde_json::to_vec_pretty(&report.diff_json).map_err(|e| ToolError::internal(e.to_string()))?;
 
     let out = create_absent_dir(&p.output_directory)?;
-    let heatmap_path = write_new_file(&out, &["heatmap.png".into()], &report.heatmap_png).map_err(ToolError::invalid)?;
-    let diff_bytes = serde_json::to_vec_pretty(&report.diff_json).map_err(|e| ToolError::internal(e.to_string()))?;
-    let diff_path = write_new_file(&out, &["diff.json".into()], &diff_bytes).map_err(ToolError::invalid)?;
+    let write_res = (|| -> Result<(std::path::PathBuf, std::path::PathBuf), ToolError> {
+        let hm = write_new_file(&out, &["heatmap.png".into()], &report.heatmap_png).map_err(ToolError::invalid)?;
+        let dj = write_new_file(&out, &["diff.json".into()], &diff_bytes).map_err(ToolError::invalid)?;
+        Ok((hm, dj))
+    })();
+    let (heatmap_path, diff_path) = match write_res {
+        Ok(paths) => paths,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&out);
+            return Err(e);
+        }
+    };
 
     let summary = format!(
         "Visual diff ({}×{}): SSIM {:.3}, mean Delta-E {:.2}, {} differing pixel(s) ({:.1}%), {} divergence region(s) → {}.",
