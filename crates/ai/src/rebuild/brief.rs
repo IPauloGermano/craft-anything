@@ -78,7 +78,8 @@ Engineering contract (follow this strict priority order when trade-offs arise):
 1. Visual and motion fidelity — match the original's layout, typography, palette, spacing, hover transitions, scroll reveals and keyframes (read `capture.json`'s `motion` section and `capture/motion/` when present).
 2. Responsive layout stability — zero sideways scroll at every width and zero unexpected layout shift (reserve space for media/fonts so CLS stays near 0).
 3. Smooth 60/120 Hz frame pacing — animate GPU-composited properties (`transform`, `opacity`, `clip-path`, `filter`, or canvas/WebGL) rather than layout-triggering properties (`top`, `left`, `width`, `height`, `margin`, `padding`); never interleave DOM layout reads and writes inside `requestAnimationFrame` or scroll handlers; respect `prefers-reduced-motion`.
-4. Clean, minimal implementation — avoid dead code, unnecessary dependencies or layout-thrashing libraries.";
+4. 3D / WebGL / WebGPU canvas fidelity — whenever `capture/canvas3d/canvas3d.json` (or `capture.json`'s `canvas_contexts`) identifies a 3D context (`webgl`, `webgl2`, `webgpu`), inspect `capture/canvas3d/canvas3d.json`, match the 3D rendering pipeline (WebGPU, WebGL2, WebGL, or Three.js) and observed render cadence (continuous `requestAnimationFrame` loop when animating, or on-demand/static rendering when static), and reproduce the shaders, compute/instanced simulation, lighting, pointer/wheel interactivity and post-processing observed in the capture rather than static fallback images or blank canvases; for `2d` canvases, reproduce the observed 2D canvas drawing and animation.
+5. Clean, minimal implementation — avoid dead code, unnecessary dependencies or layout-thrashing libraries.";
 
 /// Clean room: what the builder has of a website, all of it what a visitor sees.
 fn website_from_outside(sees: bool) -> String {

@@ -4753,6 +4753,18 @@ fn website_brief_includes_engineering_contract_and_blind_safe_motion_guidance() 
         .unwrap(),
     )
     .unwrap();
+    std::fs::create_dir_all(ws.capture_dir().join(kinds::website::CANVAS3D_DIR)).unwrap();
+    std::fs::write(
+        ws.capture_dir().join(kinds::website::CANVAS3D_DIR).join("canvas3d.json"),
+        serde_json::to_vec(&json!({
+            "contexts": ["webgl2"],
+            "has_3d_context": true,
+            "draw_calls_per_frame": 10.0,
+            "compute_dispatches_per_frame": 0.0,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     for deep in [false, true] {
         let sighted = super::brief(
             &kinds::WebsiteKind,
@@ -4765,7 +4777,10 @@ fn website_brief_includes_engineering_contract_and_blind_safe_motion_guidance() 
             None,
         );
         assert!(sighted.contains("Engineering contract") && sighted.contains("burst-scroll-01.png"), "{sighted}");
+        assert!(sighted.contains("3D / WebGL / WebGPU canvas fidelity") && sighted.contains("capture/canvas3d/canvas3d.json"), "{sighted}");
+        assert!(sighted.contains("webgl2") && sighted.contains("10.0 draw call(s)/frame"), "{sighted}");
         assert!(blind.contains("Engineering contract") && blind.contains("capture/motion/motion.json"), "{blind}");
+        assert!(blind.contains("capture/canvas3d/canvas3d.json") && blind.contains("webgl2") && blind.contains("10.0 draw call(s)/frame"), "{blind}");
         assert_eq!(said_to_look(&blind), None, "blind website motion brief must never tell the builder to look at pictures:\n{blind}");
     }
 }
