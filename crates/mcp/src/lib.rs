@@ -93,6 +93,7 @@ pub const CLEAN_ROOM_WEBSITE_TOOLS: &[&str] = &[
     "web_webgl_webgpu_probe",
     "web_page_screenshot_take",
     "web_pixels_compare",
+    "web_pixel_diff_heatmap",
     "web_site_close",
 ];
 

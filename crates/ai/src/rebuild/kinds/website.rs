@@ -268,6 +268,9 @@ impl TargetKind for WebsiteKind {
     }
 
     fn refine(&self, check: &CheckResult, sees_pictures: bool) -> String {
+        if check.check == crate::rebuild::critic::CHECK_ID {
+            return crate::rebuild::critic::refine_prompt(check, sees_pictures);
+        }
         match check.similarity {
             Some(s) if sees_pictures => format!(
                 "Check {}: compared with the original, your build looks {s:.0}% alike ({}). Your screenshots are in checks/round-{}/ (screenshot-<width>.png for each width, motion/burst-*.png for scroll/hover motion when recorded, and routes/<page>/ for other pages) with the layout measured at each width in its capture.json; the original's are in capture/. Open each pair with the Read tool, triage strictly by severity (fix the biggest visible differences first: broken layout/section order, spacing, sizes, colours, fonts, missing parts, motion/CLS regressions), fix the padding, items per row, sizes, colours and fonts the check names at each width with the exact values it gives, add any missing headings or words it lists, keep animations GPU-composited (`transform`/`opacity`), build it again, and reply with 1-2 plain sentences on what you changed.",

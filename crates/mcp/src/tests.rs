@@ -508,6 +508,7 @@ fn clean_room_lists_visitor_website_tools_including_canvas_probe() {
     for allowed in CLEAN_ROOM_WEBSITE_TOOLS {
         assert!(names.contains(&allowed.to_string()), "{allowed} should be listed in Clean room");
     }
+    assert!(CLEAN_ROOM_WEBSITE_TOOLS.contains(&"web_pixel_diff_heatmap"));
     assert!(!names.contains(&"web_page_show".to_string()), "Deep-only web tools stay hidden in Clean room");
 }
 
