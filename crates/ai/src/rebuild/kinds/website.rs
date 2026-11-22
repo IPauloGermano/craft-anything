@@ -779,27 +779,31 @@ pub fn motion_notes(original: &Value, built: &Value) -> Vec<String> {
 }
 
 /// Evaluate `motion.json` telemetry from the original vs built motion capture: produces hard
-/// `Claim`s for CLS regressions, newly introduced non-composited layout transitions, and severe
-/// main-thread stalls, plus a concise summary note.
+/// `Claim`s for CLS regressions, newly introduced non-composited layout transitions, severe
+/// main-thread stalls, and missing hover response, plus a concise summary note.
 pub fn motion_telemetry_claims(original: &Value, built: &Value) -> (Vec<Claim>, Vec<String>) {
     let (Some(ot), Some(bt)) = (original.get("telemetry"), built.get("telemetry")) else {
         return (Vec::new(), Vec::new());
     };
-    let f = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+    let f_opt = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64);
+    let f = |v: &Value, k: &str| f_opt(v, k).unwrap_or(0.0);
     let u = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
-    let strs =
-        |v: &Value, k: &str| -> Vec<String> { v.get(k).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(String::from).collect() };
+    let strs_opt = |v: &Value, k: &str| -> Option<Vec<String>> {
+        v.get(k).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+    };
 
     let mut claims = Vec::new();
     let mut notes = Vec::new();
 
-    let (o_cls, b_cls) = (f(ot, "cls"), f(bt, "cls"));
-    if o_cls <= 0.10 {
+    if let (Some(o_cls), Some(b_cls)) = (f_opt(ot, "cls"), f_opt(bt, "cls"))
+        && o_cls <= 0.10
+    {
         claims.push(Claim::new("Motion stays layout-stable (CLS <= 0.15)", b_cls <= 0.15, format!("CLS is {b_cls:.3} (original {o_cls:.3})")));
     }
 
-    let (o_non_comp, b_non_comp) = (strs(ot, "non_composited_transitions"), strs(bt, "non_composited_transitions"));
-    if o_non_comp.is_empty() {
+    if let (Some(o_non_comp), Some(b_non_comp)) = (strs_opt(ot, "non_composited_transitions"), strs_opt(bt, "non_composited_transitions"))
+        && o_non_comp.is_empty()
+    {
         claims.push(Claim::new(
             "Transitions use GPU-composited properties (no layout-triggering CSS transitions)",
             b_non_comp.is_empty(),
@@ -807,9 +811,10 @@ pub fn motion_telemetry_claims(original: &Value, built: &Value) -> (Vec<Claim>, 
         ));
     }
 
-    let (o_long_ms, b_long_ms) = (f(ot, "long_tasks_ms"), f(bt, "long_tasks_ms"));
     let (o_long_n, b_long_n) = (u(ot, "long_tasks_count"), u(bt, "long_tasks_count"));
-    if o_long_ms <= 100.0 {
+    if let (Some(o_long_ms), Some(b_long_ms)) = (f_opt(ot, "long_tasks_ms"), f_opt(bt, "long_tasks_ms"))
+        && o_long_ms <= 100.0
+    {
         claims.push(Claim::new(
             "Motion avoids severe main-thread stalls (long tasks <= 500 ms)",
             b_long_ms <= 500.0,
@@ -818,15 +823,32 @@ pub fn motion_telemetry_claims(original: &Value, built: &Value) -> (Vec<Claim>, 
     }
 
     let (o_hover_tiles, b_hover_tiles) = (u(original, "hover_changed_tiles"), u(built, "hover_changed_tiles"));
-    if o_hover_tiles > 0 && b_hover_tiles == 0 && built.get("hover_target").is_some_and(|v| !v.is_null()) {
-        notes.push("hovering the primary control changed pixels on the original, but showed no visible hover transition in the build".into());
+    if o_hover_tiles > 0 && built.get("hover_target").is_some_and(|v| !v.is_null()) {
+        claims.push(Claim::new(
+            "Primary interactive control shows visible hover feedback",
+            b_hover_tiles > 0,
+            format!("hover changed {b_hover_tiles} tile(s) (original {o_hover_tiles})"),
+        ));
+        if b_hover_tiles == 0 {
+            notes.push("hovering the primary control changed pixels on the original, but showed no visible hover transition in the build".into());
+        }
     }
 
+    let (o_cls, b_cls) = (f(ot, "cls"), f(bt, "cls"));
+    let b_long_ms = f(bt, "long_tasks_ms");
     let (b_avg, b_max) = (f(bt, "avg_frame_ms"), f(bt, "max_frame_ms"));
     notes.push(format!(
         "motion telemetry: CLS {b_cls:.3} (orig {o_cls:.3}), {b_long_n} long task(s) ({b_long_ms:.0} ms), avg frame {b_avg:.1} ms (max {b_max:.1} ms)"
     ));
     (claims, notes)
+}
+
+fn motion_telemetry_incomplete(v: &Value) -> bool {
+    let Some(t) = v.get("telemetry") else { return true };
+    t.get("missing_state").and_then(Value::as_bool) == Some(true)
+        || t.get("cls").and_then(Value::as_f64).is_none()
+        || t.get("non_composited_transitions").and_then(Value::as_array).is_none()
+        || t.get("long_tasks_ms").and_then(Value::as_f64).is_none()
 }
 
 /// Capture sequential scroll/hover motion bursts and telemetry on the build when the study did.
@@ -836,8 +858,17 @@ fn motion_check(cx: &CheckCx, base: &str, out: &Path, unknowns: &mut Vec<String>
     let ours = out.join(MOTION_DIR);
     let width = original.get("width").and_then(Value::as_u64).unwrap_or(1440);
     let height = original.get("height").and_then(Value::as_u64).unwrap_or(900);
-    cx.call("web_site_open", json!({"url": base, "settle_ms": 1000, "signed_in": false}))?;
+    if let Err(e) = cx.call("web_site_open", json!({"url": base, "settle_ms": 1000, "signed_in": false})) {
+        if e.code == craft_anything_evidence::ErrorCode::Cancelled || cx.stop().cancelled() {
+            return Err(e);
+        }
+        unknowns.push("scroll and hover motion telemetry couldn't be measured".into());
+        return Ok(vec![format!("motion telemetry couldn't be measured: {}", e.message)]);
+    }
     if let Err(e) = cx.call("web_page_motion_capture", json!({"output_directory": ours.display().to_string(), "width": width, "height": height})) {
+        if e.code == craft_anything_evidence::ErrorCode::Cancelled || cx.stop().cancelled() {
+            return Err(e);
+        }
         unknowns.push("scroll and hover motion telemetry couldn't be measured".into());
         return Ok(vec![format!("motion telemetry couldn't be measured: {}", e.message)]);
     }
@@ -845,6 +876,12 @@ fn motion_check(cx: &CheckCx, base: &str, out: &Path, unknowns: &mut Vec<String>
         unknowns.push("scroll and hover motion telemetry couldn't be read".into());
         return Ok(Vec::new());
     };
+    if motion_telemetry_incomplete(&original) || motion_telemetry_incomplete(&built) {
+        unknowns.push("scroll and hover motion telemetry was incomplete".into());
+    }
+    if original.get("hover_changed_tiles").and_then(Value::as_u64).unwrap_or(0) > 0 && built.get("hover_target").is_none_or(Value::is_null) {
+        unknowns.push("hover feedback couldn't be verified: no interactive hover target was found on the built page".into());
+    }
     let (m_claims, m_notes) = motion_telemetry_claims(&original, &built);
     claims.extend(m_claims);
     Ok(m_notes)
@@ -1099,8 +1136,8 @@ mod tests {
             "telemetry": {"cls": 0.28, "long_tasks_count": 4, "long_tasks_ms": 620.0, "avg_frame_ms": 48.0, "max_frame_ms": 220.0, "non_composited_transitions": ["top", "height"]}
         });
         let (claims, t_notes) = motion_telemetry_claims(&orig_tel, &bad_tel);
-        assert_eq!(claims.len(), 3);
-        assert!(claims.iter().all(|c| !c.passed), "all 3 motion claims should fail on regressed build: {claims:?}");
+        assert_eq!(claims.len(), 4);
+        assert!(claims.iter().all(|c| !c.passed), "all 4 motion claims should fail on regressed build: {claims:?}");
         assert!(t_notes.iter().any(|n| n.contains("hover transition")), "{t_notes:?}");
 
         let good_tel = json!({
@@ -1109,6 +1146,7 @@ mod tests {
             "telemetry": {"cls": 0.02, "long_tasks_count": 0, "long_tasks_ms": 0.0, "avg_frame_ms": 16.6, "max_frame_ms": 20.0, "non_composited_transitions": []}
         });
         let (ok_claims, _) = motion_telemetry_claims(&orig_tel, &good_tel);
+        assert_eq!(ok_claims.len(), 4);
         assert!(ok_claims.iter().all(|c| c.passed), "{ok_claims:?}");
     }
 }
