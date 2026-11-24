@@ -1077,48 +1077,19 @@ pub fn block_similarity_masked(a: &Image, b: &Image, block: u32, threshold: u8, 
     if counted == 0 { 1.0 } else { same as f64 / counted as f64 }
 }
 
-/// Share of the two pictures' union area that both pictures cover (`shared / union`, in `0.0..=1.0`),
-/// skipping pixels `mask` covers. 1.0 when both images have the same dimensions or everything is
-/// masked; 0.0 when either image is empty.
-pub fn area_overlap_masked(a: &Image, b: &Image, mask: Option<&NoiseMask>) -> f64 {
-    if a.width == 0 || a.height == 0 || b.width == 0 || b.height == 0 {
-        return 0.0;
-    }
-    if a.width == b.width && a.height == b.height {
-        return 1.0;
-    }
-    let (min_w, min_h) = (a.width.min(b.width), a.height.min(b.height));
-    let Some(m) = mask else {
-        let shared = u64::from(min_w) * u64::from(min_h);
-        let union = u64::from(a.width) * u64::from(a.height) + u64::from(b.width) * u64::from(b.height) - shared;
-        return if union == 0 { 1.0 } else { shared as f64 / union as f64 };
-    };
-    let tile = m.tile.max(1);
-    let (max_w, max_h) = (a.width.max(b.width), a.height.max(b.height));
-    let (cols, rows) = (max_w.div_ceil(tile), max_h.div_ceil(tile));
-    let (mut shared, mut union) = (0u64, 0u64);
-    for ty in 0..rows {
-        let y0 = ty * tile;
-        let y1 = (y0 + tile).min(max_h);
-        for tx in 0..cols {
-            let x0 = tx * tile;
-            if m.covers(x0, y0) {
-                continue;
-            }
-            let x1 = (x0 + tile).min(max_w);
-            let area_a = u64::from(x1.min(a.width).saturating_sub(x0)) * u64::from(y1.min(a.height).saturating_sub(y0));
-            let area_b = u64::from(x1.min(b.width).saturating_sub(x0)) * u64::from(y1.min(b.height).saturating_sub(y0));
-            let area_s = u64::from(x1.min(min_w).saturating_sub(x0)) * u64::from(y1.min(min_h).saturating_sub(y0));
-            shared += area_s;
-            union += area_a + area_b - area_s;
-        }
-    }
-    if union == 0 { 1.0 } else { shared as f64 / union as f64 }
-}
+/// Minimum share of foreground tiles an original image must have to count as non-blank (1%).
+pub const ORIGINAL_FOREGROUND_MIN: f64 = 0.01;
+/// Maximum share of foreground tiles a build may have and still be judged blank (0.5%).
+pub const BLANK_FOREGROUND_MAX: f64 = 0.005;
+/// A build must also have less than this fraction of the original's foreground to be judged blank,
+/// so a very sparse original does not falsely mark a slightly sparser rebuild as blank.
+const BLANK_RELATIVE_MAX: f64 = 0.15;
+/// Tile size used when measuring a picture's foreground content share.
+const FOREGROUND_TILE: u32 = 16;
 
-/// Dominant unmasked RGB colour of `img`, quantized into 32 bins per channel (width 8) with
-/// deterministic tie-breaking, returning the exact mean RGB of the largest bin.
-fn dominant_rgb_masked(img: &Image, mask: Option<&NoiseMask>) -> [f64; 3] {
+/// Dominant RGB colour of `img`, quantized into 32 bins per channel (width 8) with deterministic
+/// tie-breaking, returning the exact mean RGB of the largest bin.
+fn dominant_rgb(img: &Image) -> [f64; 3] {
     if img.width == 0 || img.height == 0 {
         return [0.0; 3];
     }
@@ -1129,16 +1100,14 @@ fn dominant_rgb_masked(img: &Image, mask: Option<&NoiseMask>) -> [f64; 3] {
     while y < img.height {
         let mut x = 0u32;
         while x < img.width {
-            if !mask.is_some_and(|m| m.covers(x, y)) {
-                let o = ((y as usize) * (img.width as usize) + x as usize) * 4;
-                if let Some(px) = img.rgba.get(o..o + 3) {
-                    let key = (px[0] >> 3, px[1] >> 3, px[2] >> 3);
-                    let entry = bins.entry(key).or_insert((0, [0; 3]));
-                    entry.0 += 1;
-                    entry.1[0] += u64::from(px[0]);
-                    entry.1[1] += u64::from(px[1]);
-                    entry.1[2] += u64::from(px[2]);
-                }
+            let o = ((y as usize) * (img.width as usize) + x as usize) * 4;
+            if let Some(px) = img.rgba.get(o..o + 3) {
+                let key = (px[0] >> 3, px[1] >> 3, px[2] >> 3);
+                let entry = bins.entry(key).or_insert((0, [0; 3]));
+                entry.0 += 1;
+                entry.1[0] += u64::from(px[0]);
+                entry.1[1] += u64::from(px[1]);
+                entry.1[2] += u64::from(px[2]);
             }
             x = x.saturating_add(step);
         }
@@ -1157,112 +1126,62 @@ fn dominant_rgb_masked(img: &Image, mask: Option<&NoiseMask>) -> [f64; 3] {
     [best.1[0] as f64 / n, best.1[1] as f64 / n, best.1[2] as f64 / n]
 }
 
-/// Mean RGB and luminance standard deviation of unmasked pixels inside tile (`bx`, `by`) of `img`.
-/// Returns `None` when the tile lies outside `img` or every pixel in it is masked.
-fn tile_mean_and_std_masked(img: &Image, block: u32, bx: u32, by: u32, mask: Option<&NoiseMask>) -> Option<([f64; 3], f64)> {
-    let x0 = bx.saturating_mul(block);
-    let y0 = by.saturating_mul(block);
-    if x0 >= img.width || y0 >= img.height {
-        return None;
-    }
-    let x1 = x0.saturating_add(block).min(img.width);
-    let y1 = y0.saturating_add(block).min(img.height);
-    let mut sum = [0u64; 3];
-    let mut l_sum = 0.0f64;
-    let mut l_sq = 0.0f64;
-    let mut n = 0u64;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            if mask.is_some_and(|m| m.covers(x, y)) {
-                continue;
-            }
-            let o = ((y as usize) * (img.width as usize) + x as usize) * 4;
-            if let Some(px) = img.rgba.get(o..o + 3) {
-                sum[0] += u64::from(px[0]);
-                sum[1] += u64::from(px[1]);
-                sum[2] += u64::from(px[2]);
-                let l = 0.299 * f64::from(px[0]) + 0.587 * f64::from(px[1]) + 0.114 * f64::from(px[2]);
-                l_sum += l;
-                l_sq += l * l;
-                n += 1;
-            }
-        }
-    }
-    if n == 0 {
-        return None;
-    }
-    let nf = n as f64;
-    let mean = [sum[0] as f64 / nf, sum[1] as f64 / nf, sum[2] as f64 / nf];
-    let l_mean = l_sum / nf;
-    let std = (l_sq / nf - l_mean * l_mean).max(0.0).sqrt();
-    Some((mean, std))
-}
-
-/// Foreground-only likeness between two images (even of different sizes), in `0.0..=1.0`.
+/// Share of `16×16` tiles in `img` that carry visible foreground content (`0.0..=1.0`).
 ///
-/// Estimates each picture's dominant background colour and compares `block`×`block` tiles
-/// weighted by how far each tile departs from that background (in mean colour or internal
-/// brightness spread). Uniform background tiles contribute zero weight, so a blank build cannot
-/// inherit a high score from empty margins; rows missing from the shorter picture contribute zero
-/// foreground and lower the score proportionally.
-pub fn content_similarity(a: &Image, b: &Image, block: u32) -> f64 {
-    content_similarity_masked(a, b, block, None)
-}
-
-/// [`content_similarity`] ignoring pixels `mask` covers (moving parts of the page). Everything
-/// masked or two uniformly flat images of the same colour compare as 1.0.
-pub fn content_similarity_masked(a: &Image, b: &Image, block: u32, mask: Option<&NoiseMask>) -> f64 {
-    let block = block.max(1);
-    if a.width == 0 || a.height == 0 || b.width == 0 || b.height == 0 {
+/// Estimates `img`'s dominant background colour and counts a tile as foreground when its mean RGB
+/// departs from that background by more than 8 per channel (cards, panels, banners, images) or at
+/// least 1/32 of its pixels depart by more than 16 per channel (text strokes, hairline borders,
+/// icons). Uniform flat pictures of any colour score `0.0`.
+pub fn foreground_share(img: &Image) -> f64 {
+    if img.width == 0 || img.height == 0 {
         return 0.0;
     }
-    let bg_a = dominant_rgb_masked(a, mask);
-    let bg_b = dominant_rgb_masked(b, mask);
-    let max_w = a.width.max(b.width);
-    let max_h = a.height.max(b.height);
-    let (cols, rows) = (max_w.div_ceil(block), max_h.div_ceil(block));
-
-    let energy = |tile: Option<([f64; 3], f64)>, bg: [f64; 3]| -> f64 {
-        let Some((mean, std)) = tile else {
-            return 0.0;
-        };
-        let color_diff = (mean[0] - bg[0]).abs().max((mean[1] - bg[1]).abs()).max((mean[2] - bg[2]).abs());
-        (color_diff - 10.0).max(0.0) + (std - 2.0).max(0.0) * 1.5
-    };
-    let accum = |ta: Option<([f64; 3], f64)>, tb: Option<([f64; 3], f64)>, bg: [f64; 3], num: &mut f64, denom: &mut f64| {
-        let ea = energy(ta, bg);
-        let eb = energy(tb, bg);
-        *denom += ea + eb;
-        if ea > 0.0
-            && eb > 0.0
-            && let (Some((ma, _)), Some((mb, _))) = (ta, tb)
-        {
-            let diff = (ma[0] - mb[0]).abs().max((ma[1] - mb[1]).abs()).max((ma[2] - mb[2]).abs());
-            let color_match = (1.0 - (diff - 16.0).max(0.0) / 80.0).clamp(0.0, 1.0);
-            *num += 2.0 * ea.min(eb) * color_match;
-        }
-    };
-
-    let (mut num_a, mut denom_a) = (0.0f64, 0.0f64);
-    let (mut num_b, mut denom_b) = (0.0f64, 0.0f64);
-    let same_bg = bg_a == bg_b;
+    let bg = dominant_rgb(img);
+    let bg_u8 = [bg[0].round().clamp(0.0, 255.0) as u8, bg[1].round().clamp(0.0, 255.0) as u8, bg[2].round().clamp(0.0, 255.0) as u8];
+    let (cols, rows) = (img.width.div_ceil(FOREGROUND_TILE), img.height.div_ceil(FOREGROUND_TILE));
+    let (mut fg_tiles, mut total_tiles) = (0u64, 0u64);
     for by in 0..rows {
+        let y0 = by * FOREGROUND_TILE;
+        let y1 = y0.saturating_add(FOREGROUND_TILE).min(img.height);
         for bx in 0..cols {
-            let ta = tile_mean_and_std_masked(a, block, bx, by, mask);
-            let tb = tile_mean_and_std_masked(b, block, bx, by, mask);
-            accum(ta, tb, bg_a, &mut num_a, &mut denom_a);
-            if !same_bg {
-                accum(ta, tb, bg_b, &mut num_b, &mut denom_b);
+            let x0 = bx * FOREGROUND_TILE;
+            let x1 = x0.saturating_add(FOREGROUND_TILE).min(img.width);
+            let mut sum = [0u64; 3];
+            let mut fg_pixels = 0u64;
+            let mut n = 0u64;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let o = ((y as usize) * (img.width as usize) + x as usize) * 4;
+                    if let Some(px) = img.rgba.get(o..o + 3) {
+                        sum[0] += u64::from(px[0]);
+                        sum[1] += u64::from(px[1]);
+                        sum[2] += u64::from(px[2]);
+                        let px_diff = px[0].abs_diff(bg_u8[0]).max(px[1].abs_diff(bg_u8[1])).max(px[2].abs_diff(bg_u8[2]));
+                        if px_diff > 16 {
+                            fg_pixels += 1;
+                        }
+                        n += 1;
+                    }
+                }
+            }
+            if n == 0 {
+                continue;
+            }
+            total_tiles += 1;
+            let nf = n as f64;
+            let mean_diff = (sum[0] as f64 / nf - bg[0]).abs().max((sum[1] as f64 / nf - bg[1]).abs()).max((sum[2] as f64 / nf - bg[2]).abs());
+            if mean_diff > 8.0 || fg_pixels.saturating_mul(32) >= n {
+                fg_tiles += 1;
             }
         }
     }
-    let score_a = if denom_a <= 1e-6 { 1.0 } else { (num_a / denom_a).clamp(0.0, 1.0) };
-    if same_bg {
-        score_a
-    } else {
-        let score_b = if denom_b <= 1e-6 { 1.0 } else { (num_b / denom_b).clamp(0.0, 1.0) };
-        score_a.min(score_b)
-    }
+    if total_tiles == 0 { 0.0 } else { fg_tiles as f64 / total_tiles as f64 }
+}
+
+/// Whether `after` is effectively blank compared with a non-blank `before` image, given each
+/// image's [`foreground_share`].
+pub fn after_is_blank(before_foreground: f64, after_foreground: f64) -> bool {
+    before_foreground >= ORIGINAL_FOREGROUND_MIN && after_foreground < BLANK_FOREGROUND_MAX && after_foreground < before_foreground * BLANK_RELATIVE_MAX
 }
 
 /// `img` as an 8-bit RGBA PNG.
@@ -1865,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    fn content_similarity_and_area_overlap_penalize_blank_and_truncated_builds() {
+    fn foreground_share_and_after_is_blank_separate_blank_pages_from_real_rebuilds() {
         let solid = |w: u32, h: u32, rgb: [u8; 3]| Image {
             width: w,
             height: h,
@@ -1880,60 +1799,77 @@ mod tests {
             }
         };
 
-        // Sparse light page (90%+ white) with a small dark header mark and green CTA.
-        let make_sparse = |shift_y: u32| {
-            let mut img = solid(640, 480, [255, 255, 255]);
-            fill(&mut img, 300, 32 + shift_y, 40, 40, [31, 35, 40]);
-            fill(&mut img, 220, 110 + shift_y, 200, 140, [242, 244, 247]);
-            fill(&mut img, 240, 200 + shift_y, 160, 28, [31, 136, 61]);
-            img
-        };
-        let orig = make_sparse(0);
-        let shifted = make_sparse(2);
-        let blank_white = solid(640, 480, [255, 255, 255]);
-        let blank_black = solid(640, 480, [0, 0, 0]);
-
-        assert!((content_similarity(&orig, &orig, 32) - 1.0).abs() < 1e-9);
-        assert!(content_similarity(&orig, &shifted, 32) > 0.90, "small shift stays high");
-        assert!(content_similarity(&orig, &blank_white, 32) < 0.01, "blank white scores ~0");
-        assert!(content_similarity(&orig, &blank_black, 32) < 0.01, "blank black scores ~0");
-        // Strict symmetry regardless of argument order.
-        assert!((content_similarity(&orig, &shifted, 32) - content_similarity(&shifted, &orig, 32)).abs() < 1e-12, "content_similarity must be symmetric");
-        assert!(
-            (content_similarity(&orig, &blank_black, 32) - content_similarity(&blank_black, &orig, 32)).abs() < 1e-12,
-            "content_similarity must be symmetric across different backgrounds"
-        );
-
-        // 51%/49% two-tone tie-flip: flipping which colour is 1% larger stays smooth and high.
-        let mut split_a = solid(400, 200, [20, 24, 30]);
-        fill(&mut split_a, 0, 0, 400, 98, [245, 245, 245]);
-        let mut split_b = solid(400, 200, [20, 24, 30]);
-        fill(&mut split_b, 0, 0, 400, 102, [245, 245, 245]);
-        assert!(content_similarity(&split_a, &split_b, 32) > 0.85, "two-tone tie flip must not drop sharply");
-
-        // Tall page vs truncated half-height build: both area_overlap and content_similarity drop.
-        let mut tall = solid(400, 1200, [10, 11, 12]);
-        for i in 0..6u32 {
-            fill(&mut tall, 40, 40 + i * 190, 320, 110, [220, 224, 235]);
+        // Empty and flat single-colour pictures of any colour score 0.0.
+        assert_eq!(foreground_share(&Image { width: 0, height: 0, rgba: Vec::new() }), 0.0);
+        for bg in [[255, 255, 255], [0, 0, 0], [10, 11, 12], [240, 240, 242]] {
+            assert_eq!(foreground_share(&solid(720, 450, bg)), 0.0, "flat {bg:?}");
         }
-        let half = crop(&tall, 400, 600);
-        let blank_dark = solid(400, 1200, [10, 11, 12]);
-        assert!((area_overlap_masked(&tall, &half, None) - 0.5).abs() < 1e-9);
-        assert!(content_similarity(&tall, &half, 32) < 0.70, "missing lower half reduces content likeness");
-        assert!(content_similarity(&tall, &blank_dark, 32) < 0.01, "full-height blank dark page scores ~0");
 
-        // NoiseMask excludes moving parts from both content_similarity and area_overlap.
-        let mut moving_a = solid(128, 128, [255, 255, 255]);
-        let mut moving_b = solid(128, 128, [255, 255, 255]);
-        fill(&mut moving_a, 0, 0, 128, 32, [30, 60, 180]);
-        fill(&mut moving_b, 0, 0, 128, 32, [30, 60, 180]);
-        fill(&mut moving_a, 16, 64, 32, 32, [200, 30, 30]);
-        fill(&mut moving_b, 16, 64, 32, 32, [30, 200, 30]);
-        let mask = NoiseMask::between(&moving_a, &moving_b, 24);
-        assert!(content_similarity_masked(&moving_a, &moving_b, 32, Some(&mask)) > 0.99, "masked carousel ignored");
-        let everything = NoiseMask { tile: NOISE_TILE, cols: 8, rows: 8, bits: vec![true; 64] };
-        assert_eq!(content_similarity_masked(&moving_a, &blank_black, 32, Some(&everything)), 1.0);
-        assert_eq!(area_overlap_masked(&tall, &half, Some(&NoiseMask { tile: NOISE_TILE, cols: 25, rows: 75, bits: vec![true; 25 * 75] })), 1.0);
+        // Subtle ±2 uniform background noise still counts as blank.
+        let noisy_blank = Image {
+            width: 320,
+            height: 240,
+            rgba: (0..240u32)
+                .flat_map(|y| {
+                    (0..320u32).flat_map(move |x| {
+                        let v = if (x + y) % 2 == 0 { 253 } else { 255 };
+                        [v, v, v, 255]
+                    })
+                })
+                .collect(),
+        };
+        assert_eq!(foreground_share(&noisy_blank), 0.0, "subtle background dithering is still blank");
+
+        // Sparse light sign-in page (white background, subtle #f6f8fa card, thin borders, dark icon, green button).
+        let mut login = solid(1440, 900, [255, 255, 255]);
+        fill(&mut login, 696, 40, 48, 48, [31, 35, 40]);
+        fill(&mut login, 566, 140, 308, 240, [246, 248, 250]);
+        fill(&mut login, 582, 180, 276, 32, [255, 255, 255]);
+        fill(&mut login, 582, 180, 276, 1, [208, 215, 222]);
+        fill(&mut login, 582, 310, 276, 32, [31, 136, 61]);
+        let login_fg = foreground_share(&login);
+        let blank_white_fg = foreground_share(&solid(1440, 900, [255, 255, 255]));
+        let blank_black_fg = foreground_share(&solid(1440, 900, [0, 0, 0]));
+        assert!(login_fg > ORIGINAL_FOREGROUND_MIN, "sparse login page has real foreground: {login_fg}");
+        assert!(after_is_blank(login_fg, blank_white_fg), "blank white is blank against login");
+        assert!(after_is_blank(login_fg, blank_black_fg), "blank black is blank against login");
+        assert!(!after_is_blank(login_fg, login_fg), "matching login page is not blank");
+
+        // A blank page with a tiny 16x16 broken-image speck is still blank against a real page.
+        let mut tiny_speck = solid(1440, 900, [255, 255, 255]);
+        fill(&mut tiny_speck, 8, 8, 16, 16, [80, 80, 80]);
+        assert!(after_is_blank(login_fg, foreground_share(&tiny_speck)), "tiny speck on empty viewport is still blank");
+
+        // Thin dark text strokes on white (no filled card) still register as real foreground content.
+        let mut text_only = solid(1440, 900, [255, 255, 255]);
+        for row in 0..8u32 {
+            fill(&mut text_only, 420, 120 + row * 28, 600, 2, [34, 34, 34]);
+        }
+        let text_fg = foreground_share(&text_only);
+        assert!(text_fg > ORIGINAL_FOREGROUND_MIN, "thin text strokes register as foreground: {text_fg}");
+        assert!(after_is_blank(text_fg, blank_white_fg));
+        assert!(!after_is_blank(text_fg, text_fg));
+
+        // Dark-themed page (#0a0b0c) with subtle dark cards (#141518) and white headlines:
+        // blank dominant-colour page is blank, while a shorter build or a missing section is not.
+        let mut dark = solid(720, 1600, [10, 11, 12]);
+        for i in 0..5u32 {
+            fill(&mut dark, 40, 40 + i * 300, 640, 200, [20, 21, 24]);
+            fill(&mut dark, 64, 64 + i * 300, 320, 24, [240, 242, 245]);
+        }
+        let missing_section = crop(&dark, 720, 1250);
+        let dark_fg = foreground_share(&dark);
+        assert!(after_is_blank(dark_fg, foreground_share(&solid(720, 900, [10, 11, 12]))));
+        assert!(!after_is_blank(dark_fg, foreground_share(&missing_section)), "missing section still has real foreground");
+
+        // A blank original never marks a blank build as blank.
+        assert!(!after_is_blank(blank_white_fg, blank_white_fg));
+        assert!(!after_is_blank(blank_white_fg, blank_black_fg));
+
+        // 50/50 two-tone page stays high regardless of which colour wins the dominant bin.
+        let mut split = solid(400, 200, [20, 24, 30]);
+        fill(&mut split, 0, 0, 400, 100, [245, 245, 245]);
+        assert!(foreground_share(&split) > 0.40);
     }
 }
 

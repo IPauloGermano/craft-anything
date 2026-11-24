@@ -706,7 +706,7 @@ fn screenshot_and_compare() {
 }
 
 #[test]
-fn web_pixels_compare_penalizes_blank_and_short_builds() {
+fn web_pixels_compare_reports_blankness_without_rescaling_likeness() {
     use crate::tools::web_common::{Image, encode_png};
     use base64::Engine as _;
 
@@ -724,51 +724,57 @@ fn web_pixels_compare_penalizes_blank_and_short_builds() {
         }
     };
 
-    // 1. Sparse light sign-in page (720x450, mostly white with a centered login card & button).
-    let make_login = |shift_y: u32| {
-        let mut img = solid(720, 450, [255, 255, 255]);
-        fill(&mut img, 344, 24 + shift_y, 32, 32, [31, 35, 40]);
-        fill(&mut img, 280, 90 + shift_y, 160, 140, [242, 244, 247]);
-        fill(&mut img, 294, 108 + shift_y, 132, 18, [255, 255, 255]);
-        fill(&mut img, 294, 140 + shift_y, 132, 18, [255, 255, 255]);
-        fill(&mut img, 294, 178 + shift_y, 132, 26, [31, 136, 61]);
+    let make_page = |height: u32, header_h: u32, sections: u32| {
+        let mut img = solid(720, height, [255, 255, 255]);
+        fill(&mut img, 0, 0, 720, header_h, [20, 26, 38]);
+        for i in 0..sections {
+            let y = header_h + 40 + i * 240;
+            fill(&mut img, 60, y, 600, 150, [238, 242, 248]);
+            fill(&mut img, 84, y + 24, 240, 24, [24, 30, 44]);
+            fill(&mut img, 84, y + 96, 140, 32, [31, 136, 61]);
+        }
         img
     };
-    let login_orig = make_login(0);
-    let login_good = make_login(2);
-    let login_blank = solid(720, 450, [255, 255, 255]);
+
+    let original = make_page(1450, 64, 5);
+    let shorter_faithful = make_page(1250, 64, 5);
+    let taller_header = make_page(1520, 136, 5);
+    let missing_section = make_page(1210, 64, 4);
+    let blank_white = solid(720, 900, [255, 255, 255]);
 
     let e = Engine::new(crate::testing::session());
     let cmp = |a: &Image, b: &Image| {
         call(&e, "web_pixels_compare", json!({"before": {"base64": b64(a)}, "after": {"base64": b64(b)}, "common_area": true, "tolerance": 24})).unwrap()
     };
 
-    let res_self = cmp(&login_orig, &login_orig);
-    assert!((res_self["result"]["layout_similarity"].as_f64().unwrap() - 1.0).abs() < 1e-9);
-    assert!((res_self["result"]["perceptual_similarity"].as_f64().unwrap() - 1.0).abs() < 1e-9);
-    assert!((res_self["result"]["content_similarity"].as_f64().unwrap() - 1.0).abs() < 1e-9);
-    assert!((res_self["result"]["area_coverage"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    // Faithful build whose total height differs keeps its unscaled shared-area likeness score.
+    let res_shorter = cmp(&original, &shorter_faithful);
+    assert!(
+        res_shorter["result"]["layout_similarity"].as_f64().unwrap() > 0.99 && res_shorter["result"]["perceptual_similarity"].as_f64().unwrap() > 0.99,
+        "height difference must not rescale layout/perceptual likeness: {}",
+        res_shorter["result"]
+    );
+    assert_eq!(res_shorter["result"]["after_blank"], false);
+    assert!(res_shorter["result"]["foreground"]["before"].as_f64().unwrap() > 0.30);
+    assert!(res_shorter["result"]["foreground"]["after"].as_f64().unwrap() > 0.30);
 
-    let res_good = cmp(&login_orig, &login_good);
-    let res_blank = cmp(&login_orig, &login_blank);
-    let good_content = res_good["result"]["content_similarity"].as_f64().unwrap();
-    let blank_content = res_blank["result"]["content_similarity"].as_f64().unwrap();
-    assert!(good_content > 0.85, "faithful slightly-shifted build keeps high content likeness: {good_content}");
-    assert!(blank_content < 0.05, "blank white build must not get a free floor from empty background: {blank_content}");
-
-    // 2. Tall page (720x2000) vs a single-viewport (720x450) stub that matches the top identically:
-    // unshared rows below 450 px must count as unlike instead of being cropped away.
-    let mut tall = solid(720, 2000, [255, 255, 255]);
-    for sec in 0..8u32 {
-        fill(&mut tall, 60, 40 + sec * 240, 600, 140, [30, 60, 140]);
+    // Real rebuilds with a much taller header (+72 px) or a missing section are not blank.
+    for (label, img) in [("taller header", &taller_header), ("missing section", &missing_section)] {
+        let res = cmp(&original, img);
+        assert_eq!(res["result"]["after_blank"], false, "{label}: {}", res["result"]);
+        assert!(res["result"]["foreground"]["after"].as_f64().unwrap() > 0.30, "{label}");
     }
-    let short_stub = crate::tools::web_common::crop(&tall, 720, 450);
-    let res_short = cmp(&tall, &short_stub);
-    let short_layout = res_short["result"]["layout_similarity"].as_f64().unwrap();
-    let short_detail = res_short["result"]["perceptual_similarity"].as_f64().unwrap();
-    let short_coverage = res_short["result"]["area_coverage"].as_f64().unwrap();
-    assert!(short_coverage < 0.30, "450/2000 height overlap should be ~0.225, got {short_coverage}");
-    assert!(short_layout < 0.30 && short_detail < 0.30, "missing rows must lower layout ({short_layout}) and detail ({short_detail})");
+
+    // Blank page against a real page sets typed after_blank = true and notes it in the summary,
+    // without altering the underlying likeness fields.
+    let res_blank = cmp(&original, &blank_white);
+    assert_eq!(res_blank["result"]["after_blank"], true, "{}", res_blank["result"]);
+    assert_eq!(res_blank["result"]["foreground"]["after"].as_f64().unwrap(), 0.0);
+    assert!(res_blank["summary"].as_str().unwrap().contains("blank"), "{}", res_blank["summary"]);
+
+    // Blank original against blank build is not reported as blank.
+    let res_both_blank = cmp(&blank_white, &blank_white);
+    assert_eq!(res_both_blank["result"]["after_blank"], false);
 }
 
 #[test]
