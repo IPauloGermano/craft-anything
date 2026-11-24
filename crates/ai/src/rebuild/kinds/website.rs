@@ -695,9 +695,24 @@ fn read_json(path: &Path) -> Option<Value> {
     std::fs::read(path).ok().and_then(|b| serde_json::from_slice(&b).ok())
 }
 
-/// A picture of the build against the original's, in percent: (likeness, layout, detail), then
-/// the two heights in px.
-type Likeness = (f64, f64, f64, u64, u64);
+/// A picture of the build against the original's, in percent: (likeness, layout, detail, content),
+/// then the two heights in px.
+type Likeness = (f64, f64, f64, f64, u64, u64);
+
+/// Derive `(likeness, layout, detail, content, before_height, after_height)` from a
+/// `web_pixels_compare` result. Capping the layout/detail average by `content_similarity` keeps
+/// uniform backgrounds from giving a blank or missing build a passing floor.
+fn likeness_from_compare(res: &Value) -> Option<Likeness> {
+    let layout = res.get("layout_similarity").and_then(Value::as_f64)?;
+    // Layout alone is generous to mostly empty pages; detail (SSIM) sees text and edges, and
+    // content compares foreground tiles only so empty margins cannot give a blank page credit.
+    let detail = res.get("perceptual_similarity").and_then(Value::as_f64).unwrap_or(layout);
+    let raw = (layout + detail) * 50.0;
+    let content = res.get("content_similarity").and_then(Value::as_f64).map_or(raw, |c| c * 100.0);
+    let score = raw.min(content);
+    let h = |k: &str| res.pointer(&format!("/sizes/{k}/height")).and_then(Value::as_u64).unwrap_or(0);
+    Some((score, layout * 100.0, detail * 100.0, content, h("before"), h("after")))
+}
 
 /// Compare the build's picture with the original's. None when either picture is missing or they
 /// couldn't be compared.
@@ -716,11 +731,7 @@ fn picture_likeness(cx: &CheckCx, original: &Path, built: &Path) -> Result<Optio
     let r = cx.call("web_pixels_compare", params)?;
     let v = r.to_json();
     let res = v.get("result").cloned().unwrap_or(Value::Null);
-    let Some(layout) = res.get("layout_similarity").and_then(Value::as_f64) else { return Ok(None) };
-    // Layout alone is generous to mostly empty pages; detail (SSIM) sees text and edges.
-    let detail = res.get("perceptual_similarity").and_then(Value::as_f64).unwrap_or(layout);
-    let h = |k: &str| res.pointer(&format!("/sizes/{k}/height")).and_then(Value::as_u64).unwrap_or(0);
-    Ok(Some(((layout + detail) * 50.0, layout * 100.0, detail * 100.0, h("before"), h("after"))))
+    Ok(likeness_from_compare(&res))
 }
 
 /// Open the build's menus, pop-ups and tabs the way the study opened the original's in `dir`
@@ -766,9 +777,10 @@ fn states_note(cx: &CheckCx, base: &str, out: &Path, dir: &str, unknowns: &mut V
 }
 
 /// Serve the built site on loopback, capture it like the original, and compare screenshots at
-/// each width. The likeness is the mean of layout (tile colours) and detail (SSIM of brightness).
-/// The note adds the text, the page structure and the opened menus and pop-ups; they guide the
-/// builder but don't change the score.
+/// each width. The likeness is the mean of layout (tile colours) and detail (SSIM of brightness)
+/// over the full page area, capped by foreground content likeness so blank backgrounds cannot
+/// inflate the score. The note adds the text, the page structure and the opened menus and pop-ups;
+/// they guide the builder but don't change the score.
 pub struct WebVisualCheck;
 
 /// What the check says when there is no site to look at: the places `site_dir` accepts, in the
@@ -829,8 +841,8 @@ impl Check for WebVisualCheck {
             for &w in &widths {
                 let (a, b) = (original.join(format!("screenshot-{w}.png")), built.join(format!("screenshot-{w}.png")));
                 match picture_likeness(cx, &a, &b)? {
-                    Some((s, l, d, hb, ha)) => {
-                        per_width.push((w, s, l, d, hb, ha));
+                    Some((s, l, d, c, hb, ha)) => {
+                        per_width.push((w, s, l, d, c, hb, ha));
                         artifacts.extend(b.strip_prefix(&ws.root).ok().map(Path::to_path_buf));
                     }
                     // A width the original was never pictured at is outside what was studied;
@@ -848,7 +860,7 @@ impl Check for WebVisualCheck {
             likeness.push(PageLikeness { name: name.clone(), dir: dir.clone(), similarity: score });
             let widths = per_width
                 .iter()
-                .map(|(w, s, l, d, hb, ha)| format!("{w} px: {s:.0}% alike (layout {l:.0}%, detail {d:.0}%; page height {hb} vs {ha} px)"))
+                .map(|(w, s, l, d, c, hb, ha)| format!("{w} px: {s:.0}% alike (layout {l:.0}%, detail {d:.0}%, content {c:.0}%; page height {hb} vs {ha} px)"))
                 .collect::<Vec<_>>()
                 .join("; ");
             // The page's words, parts and measured design too: a build can look alike and still
@@ -936,5 +948,75 @@ mod tests {
         assert_eq!(site_dir(d.path()), Some(d.path().to_path_buf()), "a plain page");
         std::fs::write(d.path().join("package.json"), "{}").unwrap();
         assert_eq!(site_dir(d.path()), None, "a page beside a manifest is not a built site");
+    }
+
+    /// #2422: a blank or truncated build must not score near good_enough against a real page,
+    /// while a faithful build stays high and legacy results without content_similarity still work.
+    #[test]
+    fn blank_and_short_builds_score_far_below_real_builds() {
+        use craft_anything_engine::tools::web_common::{Image, crop, encode_png};
+
+        let solid = |w: u32, h: u32, rgb: [u8; 3]| Image {
+            width: w,
+            height: h,
+            rgba: (0..(w as usize * h as usize)).flat_map(|_| [rgb[0], rgb[1], rgb[2], 255]).collect(),
+        };
+        let fill = |img: &mut Image, x0: u32, y0: u32, rw: u32, rh: u32, rgb: [u8; 3]| {
+            for y in y0..(y0 + rh).min(img.height) {
+                for x in x0..(x0 + rw).min(img.width) {
+                    let o = ((y as usize) * (img.width as usize) + x as usize) * 4;
+                    img.rgba[o..o + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+                }
+            }
+        };
+
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::create(d.path(), "Site", "Clone it", TargetRef::None).unwrap();
+        let worker = crate::rebuild::tests::check_worker(&ws, false);
+        let cx = CheckCx { worker: &worker, ws: &ws, round: 1, until: None };
+
+        let write_png = |name: &str, img: &Image| {
+            let p = d.path().join(name);
+            std::fs::write(&p, encode_png(img).unwrap()).unwrap();
+            p
+        };
+
+        // Sparse light sign-in page (mostly white) vs blank white and a slightly shifted real build.
+        let make_login = |shift_y: u32| {
+            let mut img = solid(720, 450, [255, 255, 255]);
+            fill(&mut img, 344, 24 + shift_y, 32, 32, [31, 35, 40]);
+            fill(&mut img, 280, 90 + shift_y, 160, 140, [242, 244, 247]);
+            fill(&mut img, 294, 178 + shift_y, 132, 26, [31, 136, 61]);
+            img
+        };
+        let orig = write_png("login-orig.png", &make_login(0));
+        let good = write_png("login-good.png", &make_login(2));
+        let blank = write_png("login-blank.png", &solid(720, 450, [255, 255, 255]));
+
+        let (good_score, ..) = picture_likeness(&cx, &orig, &good).unwrap().unwrap();
+        let (blank_score, _, _, blank_content, _, _) = picture_likeness(&cx, &orig, &blank).unwrap().unwrap();
+        assert!(good_score > 85.0, "faithful slightly-shifted build stays high: {good_score}");
+        assert!(blank_score < 5.0 && blank_content < 5.0, "blank white build must score near 0: score={blank_score}, content={blank_content}");
+
+        // Tall page vs single-viewport blank and matching-top stub.
+        let mut tall_img = solid(720, 2000, [255, 255, 255]);
+        for i in 0..8u32 {
+            fill(&mut tall_img, 60, 40 + i * 240, 600, 140, [30, 60, 140]);
+        }
+        let tall = write_png("tall-orig.png", &tall_img);
+        let short_stub = write_png("tall-short-stub.png", &crop(&tall_img, 720, 450));
+        let (short_blank_score, ..) = picture_likeness(&cx, &tall, &blank).unwrap().unwrap();
+        let (short_stub_score, short_layout, short_detail, _, hb, ha) = picture_likeness(&cx, &tall, &short_stub).unwrap().unwrap();
+        assert!(short_blank_score < 5.0, "blank viewport against tall page: {short_blank_score}");
+        assert!(
+            short_stub_score < 30.0 && short_layout < 30.0 && short_detail < 30.0,
+            "stub missing lower rows: score={short_stub_score}, layout={short_layout}, detail={short_detail}"
+        );
+        assert_eq!((hb, ha), (2000, 450));
+
+        // Backward compatibility: a compare result without content_similarity still computes (layout + detail) * 50.
+        let legacy = json!({"layout_similarity": 0.8, "perceptual_similarity": 0.6, "sizes": {"before": {"height": 1000}, "after": {"height": 1000}}});
+        let (legacy_score, ..) = likeness_from_compare(&legacy).unwrap();
+        assert!((legacy_score - 70.0).abs() < 1e-9, "legacy result without content_similarity: {legacy_score}");
     }
 }

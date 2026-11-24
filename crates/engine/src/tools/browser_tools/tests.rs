@@ -706,6 +706,72 @@ fn screenshot_and_compare() {
 }
 
 #[test]
+fn web_pixels_compare_penalizes_blank_and_short_builds() {
+    use crate::tools::web_common::{Image, encode_png};
+    use base64::Engine as _;
+
+    let b64 = |img: &Image| base64::engine::general_purpose::STANDARD.encode(encode_png(img).unwrap());
+    let solid = |w: u32, h: u32, rgb: [u8; 3]| {
+        let rgba: Vec<u8> = (0..(w as usize * h as usize)).flat_map(|_| [rgb[0], rgb[1], rgb[2], 255]).collect();
+        Image { width: w, height: h, rgba }
+    };
+    let fill = |img: &mut Image, x0: u32, y0: u32, rw: u32, rh: u32, rgb: [u8; 3]| {
+        for y in y0..(y0 + rh).min(img.height) {
+            for x in x0..(x0 + rw).min(img.width) {
+                let o = ((y as usize) * (img.width as usize) + x as usize) * 4;
+                img.rgba[o..o + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+        }
+    };
+
+    // 1. Sparse light sign-in page (720x450, mostly white with a centered login card & button).
+    let make_login = |shift_y: u32| {
+        let mut img = solid(720, 450, [255, 255, 255]);
+        fill(&mut img, 344, 24 + shift_y, 32, 32, [31, 35, 40]);
+        fill(&mut img, 280, 90 + shift_y, 160, 140, [242, 244, 247]);
+        fill(&mut img, 294, 108 + shift_y, 132, 18, [255, 255, 255]);
+        fill(&mut img, 294, 140 + shift_y, 132, 18, [255, 255, 255]);
+        fill(&mut img, 294, 178 + shift_y, 132, 26, [31, 136, 61]);
+        img
+    };
+    let login_orig = make_login(0);
+    let login_good = make_login(2);
+    let login_blank = solid(720, 450, [255, 255, 255]);
+
+    let e = Engine::new(crate::testing::session());
+    let cmp = |a: &Image, b: &Image| {
+        call(&e, "web_pixels_compare", json!({"before": {"base64": b64(a)}, "after": {"base64": b64(b)}, "common_area": true, "tolerance": 24})).unwrap()
+    };
+
+    let res_self = cmp(&login_orig, &login_orig);
+    assert!((res_self["result"]["layout_similarity"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    assert!((res_self["result"]["perceptual_similarity"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    assert!((res_self["result"]["content_similarity"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    assert!((res_self["result"]["area_coverage"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+
+    let res_good = cmp(&login_orig, &login_good);
+    let res_blank = cmp(&login_orig, &login_blank);
+    let good_content = res_good["result"]["content_similarity"].as_f64().unwrap();
+    let blank_content = res_blank["result"]["content_similarity"].as_f64().unwrap();
+    assert!(good_content > 0.85, "faithful slightly-shifted build keeps high content likeness: {good_content}");
+    assert!(blank_content < 0.05, "blank white build must not get a free floor from empty background: {blank_content}");
+
+    // 2. Tall page (720x2000) vs a single-viewport (720x450) stub that matches the top identically:
+    // unshared rows below 450 px must count as unlike instead of being cropped away.
+    let mut tall = solid(720, 2000, [255, 255, 255]);
+    for sec in 0..8u32 {
+        fill(&mut tall, 60, 40 + sec * 240, 600, 140, [30, 60, 140]);
+    }
+    let short_stub = crate::tools::web_common::crop(&tall, 720, 450);
+    let res_short = cmp(&tall, &short_stub);
+    let short_layout = res_short["result"]["layout_similarity"].as_f64().unwrap();
+    let short_detail = res_short["result"]["perceptual_similarity"].as_f64().unwrap();
+    let short_coverage = res_short["result"]["area_coverage"].as_f64().unwrap();
+    assert!(short_coverage < 0.30, "450/2000 height overlap should be ~0.225, got {short_coverage}");
+    assert!(short_layout < 0.30 && short_detail < 0.30, "missing rows must lower layout ({short_layout}) and detail ({short_detail})");
+}
+
+#[test]
 fn no_endpoint_no_launch_is_provider_unavailable() {
     // Empty engine store and no endpoint: every browser tool must refuse with a clear remediation.
     let e = Engine::new(crate::testing::session());

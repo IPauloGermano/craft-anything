@@ -1077,6 +1077,194 @@ pub fn block_similarity_masked(a: &Image, b: &Image, block: u32, threshold: u8, 
     if counted == 0 { 1.0 } else { same as f64 / counted as f64 }
 }
 
+/// Share of the two pictures' union area that both pictures cover (`shared / union`, in `0.0..=1.0`),
+/// skipping pixels `mask` covers. 1.0 when both images have the same dimensions or everything is
+/// masked; 0.0 when either image is empty.
+pub fn area_overlap_masked(a: &Image, b: &Image, mask: Option<&NoiseMask>) -> f64 {
+    if a.width == 0 || a.height == 0 || b.width == 0 || b.height == 0 {
+        return 0.0;
+    }
+    if a.width == b.width && a.height == b.height {
+        return 1.0;
+    }
+    let (min_w, min_h) = (a.width.min(b.width), a.height.min(b.height));
+    let Some(m) = mask else {
+        let shared = u64::from(min_w) * u64::from(min_h);
+        let union = u64::from(a.width) * u64::from(a.height) + u64::from(b.width) * u64::from(b.height) - shared;
+        return if union == 0 { 1.0 } else { shared as f64 / union as f64 };
+    };
+    let tile = m.tile.max(1);
+    let (max_w, max_h) = (a.width.max(b.width), a.height.max(b.height));
+    let (cols, rows) = (max_w.div_ceil(tile), max_h.div_ceil(tile));
+    let (mut shared, mut union) = (0u64, 0u64);
+    for ty in 0..rows {
+        let y0 = ty * tile;
+        let y1 = (y0 + tile).min(max_h);
+        for tx in 0..cols {
+            let x0 = tx * tile;
+            if m.covers(x0, y0) {
+                continue;
+            }
+            let x1 = (x0 + tile).min(max_w);
+            let area_a = u64::from(x1.min(a.width).saturating_sub(x0)) * u64::from(y1.min(a.height).saturating_sub(y0));
+            let area_b = u64::from(x1.min(b.width).saturating_sub(x0)) * u64::from(y1.min(b.height).saturating_sub(y0));
+            let area_s = u64::from(x1.min(min_w).saturating_sub(x0)) * u64::from(y1.min(min_h).saturating_sub(y0));
+            shared += area_s;
+            union += area_a + area_b - area_s;
+        }
+    }
+    if union == 0 { 1.0 } else { shared as f64 / union as f64 }
+}
+
+/// Dominant unmasked RGB colour of `img`, quantized into 32 bins per channel (width 8) with
+/// deterministic tie-breaking, returning the exact mean RGB of the largest bin.
+fn dominant_rgb_masked(img: &Image, mask: Option<&NoiseMask>) -> [f64; 3] {
+    if img.width == 0 || img.height == 0 {
+        return [0.0; 3];
+    }
+    let pixels = u64::from(img.width) * u64::from(img.height);
+    let step = ((pixels / 200_000) as f64).sqrt().ceil().max(1.0) as u32;
+    let mut bins: std::collections::BTreeMap<(u8, u8, u8), (u64, [u64; 3])> = std::collections::BTreeMap::new();
+    let mut y = 0u32;
+    while y < img.height {
+        let mut x = 0u32;
+        while x < img.width {
+            if !mask.is_some_and(|m| m.covers(x, y)) {
+                let o = ((y as usize) * (img.width as usize) + x as usize) * 4;
+                if let Some(px) = img.rgba.get(o..o + 3) {
+                    let key = (px[0] >> 3, px[1] >> 3, px[2] >> 3);
+                    let entry = bins.entry(key).or_insert((0, [0; 3]));
+                    entry.0 += 1;
+                    entry.1[0] += u64::from(px[0]);
+                    entry.1[1] += u64::from(px[1]);
+                    entry.1[2] += u64::from(px[2]);
+                }
+            }
+            x = x.saturating_add(step);
+        }
+        y = y.saturating_add(step);
+    }
+    let mut best = (0u64, [0u64; 3]);
+    for (_, (count, sum)) in bins {
+        if count > best.0 {
+            best = (count, sum);
+        }
+    }
+    if best.0 == 0 {
+        return [0.0; 3];
+    }
+    let n = best.0 as f64;
+    [best.1[0] as f64 / n, best.1[1] as f64 / n, best.1[2] as f64 / n]
+}
+
+/// Mean RGB and luminance standard deviation of unmasked pixels inside tile (`bx`, `by`) of `img`.
+/// Returns `None` when the tile lies outside `img` or every pixel in it is masked.
+fn tile_mean_and_std_masked(img: &Image, block: u32, bx: u32, by: u32, mask: Option<&NoiseMask>) -> Option<([f64; 3], f64)> {
+    let x0 = bx.saturating_mul(block);
+    let y0 = by.saturating_mul(block);
+    if x0 >= img.width || y0 >= img.height {
+        return None;
+    }
+    let x1 = x0.saturating_add(block).min(img.width);
+    let y1 = y0.saturating_add(block).min(img.height);
+    let mut sum = [0u64; 3];
+    let mut l_sum = 0.0f64;
+    let mut l_sq = 0.0f64;
+    let mut n = 0u64;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if mask.is_some_and(|m| m.covers(x, y)) {
+                continue;
+            }
+            let o = ((y as usize) * (img.width as usize) + x as usize) * 4;
+            if let Some(px) = img.rgba.get(o..o + 3) {
+                sum[0] += u64::from(px[0]);
+                sum[1] += u64::from(px[1]);
+                sum[2] += u64::from(px[2]);
+                let l = 0.299 * f64::from(px[0]) + 0.587 * f64::from(px[1]) + 0.114 * f64::from(px[2]);
+                l_sum += l;
+                l_sq += l * l;
+                n += 1;
+            }
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    let nf = n as f64;
+    let mean = [sum[0] as f64 / nf, sum[1] as f64 / nf, sum[2] as f64 / nf];
+    let l_mean = l_sum / nf;
+    let std = (l_sq / nf - l_mean * l_mean).max(0.0).sqrt();
+    Some((mean, std))
+}
+
+/// Foreground-only likeness between two images (even of different sizes), in `0.0..=1.0`.
+///
+/// Estimates each picture's dominant background colour and compares `block`×`block` tiles
+/// weighted by how far each tile departs from that background (in mean colour or internal
+/// brightness spread). Uniform background tiles contribute zero weight, so a blank build cannot
+/// inherit a high score from empty margins; rows missing from the shorter picture contribute zero
+/// foreground and lower the score proportionally.
+pub fn content_similarity(a: &Image, b: &Image, block: u32) -> f64 {
+    content_similarity_masked(a, b, block, None)
+}
+
+/// [`content_similarity`] ignoring pixels `mask` covers (moving parts of the page). Everything
+/// masked or two uniformly flat images of the same colour compare as 1.0.
+pub fn content_similarity_masked(a: &Image, b: &Image, block: u32, mask: Option<&NoiseMask>) -> f64 {
+    let block = block.max(1);
+    if a.width == 0 || a.height == 0 || b.width == 0 || b.height == 0 {
+        return 0.0;
+    }
+    let bg_a = dominant_rgb_masked(a, mask);
+    let bg_b = dominant_rgb_masked(b, mask);
+    let max_w = a.width.max(b.width);
+    let max_h = a.height.max(b.height);
+    let (cols, rows) = (max_w.div_ceil(block), max_h.div_ceil(block));
+
+    let energy = |tile: Option<([f64; 3], f64)>, bg: [f64; 3]| -> f64 {
+        let Some((mean, std)) = tile else {
+            return 0.0;
+        };
+        let color_diff = (mean[0] - bg[0]).abs().max((mean[1] - bg[1]).abs()).max((mean[2] - bg[2]).abs());
+        (color_diff - 10.0).max(0.0) + (std - 2.0).max(0.0) * 1.5
+    };
+    let accum = |ta: Option<([f64; 3], f64)>, tb: Option<([f64; 3], f64)>, bg: [f64; 3], num: &mut f64, denom: &mut f64| {
+        let ea = energy(ta, bg);
+        let eb = energy(tb, bg);
+        *denom += ea + eb;
+        if ea > 0.0
+            && eb > 0.0
+            && let (Some((ma, _)), Some((mb, _))) = (ta, tb)
+        {
+            let diff = (ma[0] - mb[0]).abs().max((ma[1] - mb[1]).abs()).max((ma[2] - mb[2]).abs());
+            let color_match = (1.0 - (diff - 16.0).max(0.0) / 80.0).clamp(0.0, 1.0);
+            *num += 2.0 * ea.min(eb) * color_match;
+        }
+    };
+
+    let (mut num_a, mut denom_a) = (0.0f64, 0.0f64);
+    let (mut num_b, mut denom_b) = (0.0f64, 0.0f64);
+    let same_bg = bg_a == bg_b;
+    for by in 0..rows {
+        for bx in 0..cols {
+            let ta = tile_mean_and_std_masked(a, block, bx, by, mask);
+            let tb = tile_mean_and_std_masked(b, block, bx, by, mask);
+            accum(ta, tb, bg_a, &mut num_a, &mut denom_a);
+            if !same_bg {
+                accum(ta, tb, bg_b, &mut num_b, &mut denom_b);
+            }
+        }
+    }
+    let score_a = if denom_a <= 1e-6 { 1.0 } else { (num_a / denom_a).clamp(0.0, 1.0) };
+    if same_bg {
+        score_a
+    } else {
+        let score_b = if denom_b <= 1e-6 { 1.0 } else { (num_b / denom_b).clamp(0.0, 1.0) };
+        score_a.min(score_b)
+    }
+}
+
 /// `img` as an 8-bit RGBA PNG.
 pub fn encode_png(img: &Image) -> Result<Vec<u8>, ToolError> {
     let mut out = Vec::new();
@@ -1674,6 +1862,78 @@ mod tests {
         assert_eq!(perceptual_similarity(&stripes, &img(100, 120, &|_, _| 0)), 0.0, "different sizes");
         let big = img(2000, 40, &|x, _| (x % 256) as u8);
         assert!(perceptual_similarity(&big, &big) > 0.999, "shrunk before comparing");
+    }
+
+    #[test]
+    fn content_similarity_and_area_overlap_penalize_blank_and_truncated_builds() {
+        let solid = |w: u32, h: u32, rgb: [u8; 3]| Image {
+            width: w,
+            height: h,
+            rgba: (0..(w as usize * h as usize)).flat_map(|_| [rgb[0], rgb[1], rgb[2], 255]).collect(),
+        };
+        let fill = |img: &mut Image, x0: u32, y0: u32, rw: u32, rh: u32, rgb: [u8; 3]| {
+            for y in y0..(y0 + rh).min(img.height) {
+                for x in x0..(x0 + rw).min(img.width) {
+                    let o = ((y as usize) * (img.width as usize) + x as usize) * 4;
+                    img.rgba[o..o + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+                }
+            }
+        };
+
+        // Sparse light page (90%+ white) with a small dark header mark and green CTA.
+        let make_sparse = |shift_y: u32| {
+            let mut img = solid(640, 480, [255, 255, 255]);
+            fill(&mut img, 300, 32 + shift_y, 40, 40, [31, 35, 40]);
+            fill(&mut img, 220, 110 + shift_y, 200, 140, [242, 244, 247]);
+            fill(&mut img, 240, 200 + shift_y, 160, 28, [31, 136, 61]);
+            img
+        };
+        let orig = make_sparse(0);
+        let shifted = make_sparse(2);
+        let blank_white = solid(640, 480, [255, 255, 255]);
+        let blank_black = solid(640, 480, [0, 0, 0]);
+
+        assert!((content_similarity(&orig, &orig, 32) - 1.0).abs() < 1e-9);
+        assert!(content_similarity(&orig, &shifted, 32) > 0.90, "small shift stays high");
+        assert!(content_similarity(&orig, &blank_white, 32) < 0.01, "blank white scores ~0");
+        assert!(content_similarity(&orig, &blank_black, 32) < 0.01, "blank black scores ~0");
+        // Strict symmetry regardless of argument order.
+        assert!((content_similarity(&orig, &shifted, 32) - content_similarity(&shifted, &orig, 32)).abs() < 1e-12, "content_similarity must be symmetric");
+        assert!(
+            (content_similarity(&orig, &blank_black, 32) - content_similarity(&blank_black, &orig, 32)).abs() < 1e-12,
+            "content_similarity must be symmetric across different backgrounds"
+        );
+
+        // 51%/49% two-tone tie-flip: flipping which colour is 1% larger stays smooth and high.
+        let mut split_a = solid(400, 200, [20, 24, 30]);
+        fill(&mut split_a, 0, 0, 400, 98, [245, 245, 245]);
+        let mut split_b = solid(400, 200, [20, 24, 30]);
+        fill(&mut split_b, 0, 0, 400, 102, [245, 245, 245]);
+        assert!(content_similarity(&split_a, &split_b, 32) > 0.85, "two-tone tie flip must not drop sharply");
+
+        // Tall page vs truncated half-height build: both area_overlap and content_similarity drop.
+        let mut tall = solid(400, 1200, [10, 11, 12]);
+        for i in 0..6u32 {
+            fill(&mut tall, 40, 40 + i * 190, 320, 110, [220, 224, 235]);
+        }
+        let half = crop(&tall, 400, 600);
+        let blank_dark = solid(400, 1200, [10, 11, 12]);
+        assert!((area_overlap_masked(&tall, &half, None) - 0.5).abs() < 1e-9);
+        assert!(content_similarity(&tall, &half, 32) < 0.70, "missing lower half reduces content likeness");
+        assert!(content_similarity(&tall, &blank_dark, 32) < 0.01, "full-height blank dark page scores ~0");
+
+        // NoiseMask excludes moving parts from both content_similarity and area_overlap.
+        let mut moving_a = solid(128, 128, [255, 255, 255]);
+        let mut moving_b = solid(128, 128, [255, 255, 255]);
+        fill(&mut moving_a, 0, 0, 128, 32, [30, 60, 180]);
+        fill(&mut moving_b, 0, 0, 128, 32, [30, 60, 180]);
+        fill(&mut moving_a, 16, 64, 32, 32, [200, 30, 30]);
+        fill(&mut moving_b, 16, 64, 32, 32, [30, 200, 30]);
+        let mask = NoiseMask::between(&moving_a, &moving_b, 24);
+        assert!(content_similarity_masked(&moving_a, &moving_b, 32, Some(&mask)) > 0.99, "masked carousel ignored");
+        let everything = NoiseMask { tile: NOISE_TILE, cols: 8, rows: 8, bits: vec![true; 64] };
+        assert_eq!(content_similarity_masked(&moving_a, &blank_black, 32, Some(&everything)), 1.0);
+        assert_eq!(area_overlap_masked(&tall, &half, Some(&NoiseMask { tile: NOISE_TILE, cols: 25, rows: 75, bits: vec![true; 25 * 75] })), 1.0);
     }
 }
 

@@ -1667,13 +1667,17 @@ pub struct CompareScreenshotsParams {
     #[serde(default)]
     pub tolerance: u8,
     /// Compare the area both images share (top-left) when their sizes differ, and add a coarse
-    /// `layout_similarity` (0..1, share of 16 px tiles with matching mean colour) and a
-    /// `perceptual_similarity` (0..1, mean SSIM of brightness: edges, text, texture). Use it to
+    /// `layout_similarity` (0..1, share of 16 px tiles with matching mean colour), a
+    /// `perceptual_similarity` (0..1, mean SSIM of brightness: edges, text, texture), a
+    /// `content_similarity` (0..1, foreground-only likeness so uniform backgrounds cannot inflate
+    /// the score) and `area_coverage` (0..1, unmasked shared area over union area, which scales
+    /// `layout_similarity` and `perceptual_similarity` so missing rows count as unlike). Use it to
     /// compare a rebuild with the original page, whose heights rarely match exactly.
     #[serde(default)]
     pub common_area: bool,
     /// With common_area: a noise-<width>.png mask from web_site_capture ({path} or {base64});
-    /// its white squares (parts that change by themselves) are left out of the layout and detail.
+    /// its white squares (parts that change by themselves) are left out of the layout, detail and
+    /// foreground content scores.
     #[serde(default)]
     pub ignore: Option<Value>,
 }
@@ -1686,6 +1690,11 @@ fn web_pixels_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
     let mut img_a = web_common::decode_png(&a)?;
     let mut img_b = web_common::decode_png(&b)?;
     let sizes = json!({"before": {"width": img_a.width, "height": img_a.height}, "after": {"width": img_b.width, "height": img_b.height}});
+    let (area_coverage, content_sim) = if p.common_area {
+        (web_common::area_overlap_masked(&img_a, &img_b, mask.as_ref()), web_common::content_similarity_masked(&img_a, &img_b, 32, mask.as_ref()))
+    } else {
+        (1.0, 1.0)
+    };
     if p.common_area {
         let (w, h) = (img_a.width.min(img_b.width), img_a.height.min(img_b.height));
         img_a = web_common::crop(&img_a, w, h);
@@ -1695,9 +1704,12 @@ fn web_pixels_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
     if p.common_area
         && let Some(o) = diff.as_object_mut()
     {
-        let sim = web_common::block_similarity_masked(&img_a, &img_b, 16, 24, mask.as_ref());
+        let sim = web_common::block_similarity_masked(&img_a, &img_b, 16, 24, mask.as_ref()) * area_coverage;
+        let detail = web_common::perceptual_similarity_masked(&img_a, &img_b, mask.as_ref()) * area_coverage;
         o.insert("layout_similarity".into(), json!(sim));
-        o.insert("perceptual_similarity".into(), json!(web_common::perceptual_similarity_masked(&img_a, &img_b, mask.as_ref())));
+        o.insert("perceptual_similarity".into(), json!(detail));
+        o.insert("content_similarity".into(), json!(content_sim));
+        o.insert("area_coverage".into(), json!(area_coverage));
         o.insert("sizes".into(), sizes);
         if let Some(m) = &mask {
             o.insert("ignored_tiles".into(), json!(m.count()));
@@ -1705,11 +1717,13 @@ fn web_pixels_compare(ctx: &mut Ctx<'_>, params: Value) -> Result<ToolOutput, To
     }
     let summary = if let Some(sim) = diff.get("layout_similarity").and_then(Value::as_f64) {
         format!(
-            "Over the shared {}×{} area the layout is {:.0}% alike and the detail {:.0}% ({} pixel(s) differ exactly).",
+            "Over the {}×{} shared area ({:.0}% of total area) layout is {:.0}% alike, detail {:.0}% and foreground content {:.0}% ({} pixel(s) differ in the shared area).",
             img_a.width,
             img_a.height,
+            area_coverage * 100.0,
             sim * 100.0,
             diff.get("perceptual_similarity").and_then(Value::as_f64).unwrap_or(0.0) * 100.0,
+            content_sim * 100.0,
             diff["differing_pixels"]
         )
     } else if diff["comparable"] == false {

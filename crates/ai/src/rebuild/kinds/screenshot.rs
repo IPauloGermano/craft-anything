@@ -8,7 +8,7 @@
 //! the two windows look and which of the original's labelled controls the build lacks.
 
 use super::*;
-use craft_anything_engine::tools::web_common::{Image, decode_picture, decode_png, perceptual_similarity, resize};
+use craft_anything_engine::tools::web_common::{Image, block_similarity, content_similarity, decode_picture, decode_png, perceptual_similarity, resize};
 use craft_anything_engine::workspace::Claim;
 use craft_anything_platform::process::Process;
 
@@ -359,8 +359,9 @@ pub enum Likeness {
     NoPictures,
 }
 
-/// The closest of the person's pictures (PNG, JPEG, WebP or GIF): the mean of perceptual detail and coarse layout,
-/// both pictures brought to the same size first.
+/// The closest of the person's pictures (PNG, JPEG, WebP or GIF): the mean of perceptual detail and
+/// coarse layout, capped by foreground content likeness so blank backgrounds cannot inflate the
+/// score, with both pictures brought to the same size first.
 pub fn picture_likeness(shot: &Image, pictures: &[PathBuf]) -> Likeness {
     if pictures.is_empty() {
         return Likeness::NoPictures;
@@ -371,8 +372,9 @@ pub fn picture_likeness(shot: &Image, pictures: &[PathBuf]) -> Likeness {
         let Some(b) = std::fs::read(p).ok().and_then(|bytes| decode_picture(&bytes).ok()) else { continue };
         let b = resize(&b, COMPARE.0, COMPARE.1);
         let detail = perceptual_similarity(&a, &b);
-        let layout = craft_anything_engine::tools::web_common::block_similarity(&a, &b, 16, 24);
-        let score = (detail + layout) * 50.0;
+        let layout = block_similarity(&a, &b, 16, 24);
+        let content = content_similarity(&a, &b, 32);
+        let score = ((detail + layout) * 50.0).min(content * 100.0);
         // "reference/picture-1.png", or "capture/window.png" for the original running.
         let folder = p.parent().and_then(|d| d.file_name()).map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
         let name = p.file_name().map(|n| format!("{folder}/{}", n.to_string_lossy())).unwrap_or_default();
@@ -533,5 +535,29 @@ mod tests {
         assert_eq!(small.rgba, [0, 0, 0, 255, 255, 255, 255, 255]);
         let back = decode_png(&encode_png(&half).unwrap()).unwrap();
         assert_eq!(back.rgba, half.rgba, "encode and decode round-trip");
+    }
+
+    #[test]
+    fn blank_window_scores_far_below_a_matching_build_against_a_sparse_reference() {
+        let d = tempfile::tempdir().unwrap();
+        let ref_path = d.path().join("window.png");
+        let sparse_ui = img(640, 360, &|x, y| {
+            if (240..400).contains(&x) && (120..240).contains(&y) {
+                if (260..380).contains(&x) && (190..220).contains(&y) { [31, 136, 61] } else { [230, 234, 240] }
+            } else {
+                [255, 255, 255]
+            }
+        });
+        std::fs::write(&ref_path, encode_png(&sparse_ui).unwrap()).unwrap();
+        let blank_white = img(640, 360, &|_, _| [255, 255, 255]);
+
+        let Likeness::Best { score: blank_score, .. } = picture_likeness(&blank_white, std::slice::from_ref(&ref_path)) else {
+            panic!("expected Best likeness for blank white");
+        };
+        let Likeness::Best { score: same_score, .. } = picture_likeness(&sparse_ui, std::slice::from_ref(&ref_path)) else {
+            panic!("expected Best likeness for matching window");
+        };
+        assert!(same_score > 95.0, "matching window should score near 100%: {same_score}");
+        assert!(blank_score < 15.0, "blank white window must not get a free floor from white background: {blank_score}");
     }
 }
