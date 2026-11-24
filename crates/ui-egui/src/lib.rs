@@ -159,11 +159,14 @@ pub enum Done {
     /// What a scan found, and why an expected coding agent may be missing.
     Detected(Vec<Detected>, Vec<craft_anything_ai::detect::DetectHint>),
     AgentConnection(String, Result<String, String>),
-    /// The configured backends, the ones chosen to build with and to extract with, and each one's
-    /// options. The first field is when the snapshot was read (see [`backends`]).
+    /// The configured backends, the ones chosen to build with, to extract with, and to review
+    /// screenshots with (plus any critic-specific model override), and each one's options. The
+    /// first field is when the snapshot was read (see [`backends`]).
     Backends(
         u64,
         Vec<BackendConfig>,
+        Option<String>,
+        Option<String>,
         Option<String>,
         Option<String>,
         std::collections::BTreeMap<String, craft_anything_ai::BackendOptions>,
@@ -172,6 +175,11 @@ pub enum Done {
     ),
     /// The models an AI can be set to (Settings → AI's model picker).
     ModelChoices {
+        name: String,
+        result: Result<Vec<String>, ToolError>,
+    },
+    /// The models the chosen blind visual critic backend can be set to.
+    ReviewerModelChoices {
         name: String,
         result: Result<Vec<String>, ToolError>,
     },
@@ -484,6 +492,8 @@ pub struct CraftApp {
     /// The AI whose model is being chosen in Settings → AI, and the models it offers once they've
     /// come (`None`: still asking).
     pub model_picker: Option<(String, Option<Vec<String>>)>,
+    /// The reviewer backend whose critic-only model override is being chosen, and its offered models.
+    pub reviewer_model_picker: Option<(String, Option<Vec<String>>)>,
     pub agent_model_picker: Option<builders::AgentModelPicker>,
     model_request: u64,
     pub model_tuning: std::collections::BTreeMap<String, ModelTuningDraft>,
@@ -495,6 +505,10 @@ pub struct CraftApp {
     pub builder: Option<String>,
     /// The backend chosen to take a game's files out in Deep mode, if any.
     pub extractor: Option<String>,
+    /// The backend chosen to review screenshots as a blind visual critic after each check round, if any.
+    pub reviewer: Option<String>,
+    /// Optional model override used only by the blind visual critic (`None`: use the reviewer backend's model).
+    pub reviewer_model: Option<String>,
     pub detected: Option<Vec<Detected>>,
     /// Why an expected coding agent may be missing, from the last scan.
     pub detect_hints: Vec<craft_anything_ai::detect::DetectHint>,
@@ -640,6 +654,7 @@ impl CraftApp {
             backend_options: Default::default(),
             program_replaced: Default::default(),
             model_picker: None,
+            reviewer_model_picker: None,
             agent_model_picker: None,
             model_request: 0,
             model_tuning: Default::default(),
@@ -647,6 +662,8 @@ impl CraftApp {
             folder_inputs: Default::default(),
             builder: None,
             extractor: None,
+            reviewer: None,
+            reviewer_model: None,
             detected: None,
             detect_hints: Vec::new(),
             detecting: false,
@@ -1361,11 +1378,24 @@ impl CraftApp {
         });
     }
 
-    /// Choose the backend that builds or extracts (`None`: its default).
+    /// Choose the backend that builds, extracts or reviews (`None`: its default).
     pub fn set_role(&mut self, role: craft_anything_ai::Role, name: Option<String>) {
+        if role == craft_anything_ai::Role::Reviewer {
+            self.reviewer_model_picker = None;
+        }
         let hub = self.hub.clone();
         self.jobs.spawn(tr("Choose an AI's job"), true, move |_| {
             hub.set_role(role, name.as_deref()).map_err(|e| e.message)?;
+            Ok(backends(&hub))
+        });
+    }
+
+    /// Choose (or clear, with `None`) a model override used exclusively by the blind visual critic.
+    pub fn set_reviewer_model(&mut self, model: Option<String>) {
+        self.reviewer_model_picker = None;
+        let hub = self.hub.clone();
+        self.jobs.spawn(tr("Change the visual critic's model"), true, move |_| {
+            hub.set_reviewer_model(model.as_deref()).map_err(|e| e.message)?;
             Ok(backends(&hub))
         });
     }
@@ -1689,7 +1719,7 @@ impl CraftApp {
             Done::AgentConnection(name, result) => {
                 self.agent_connections.insert(name, Some(result));
             }
-            Done::Backends(read, b, builder, extractor, options, replaced) => {
+            Done::Backends(read, b, builder, extractor, reviewer, reviewer_model, options, replaced) => {
                 if read < self.backends_read {
                     return;
                 }
@@ -1700,6 +1730,11 @@ impl CraftApp {
                 self.backends = b;
                 self.builder = builder;
                 self.extractor = extractor;
+                self.reviewer = reviewer;
+                self.reviewer_model = reviewer_model;
+                if self.reviewer_model_picker.as_ref().is_some_and(|(n, _)| self.reviewer.as_deref() != Some(n.as_str())) {
+                    self.reviewer_model_picker = None;
+                }
                 self.backend_options = options;
                 self.program_replaced = replaced;
                 self.model_tuning.retain(|name, state| {
@@ -1741,6 +1776,16 @@ impl CraftApp {
                 Ok(_) => {}
                 Err(e) => {
                     self.model_picker = None;
+                    self.toast(e.for_people(), true);
+                }
+            },
+            Done::ReviewerModelChoices { name, result } => match result {
+                Ok(models) if self.reviewer_model_picker.as_ref().is_some_and(|(n, _)| *n == name) => {
+                    self.reviewer_model_picker = Some((name, Some(models)));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.reviewer_model_picker = None;
                     self.toast(e.for_people(), true);
                 }
             },
@@ -2259,7 +2304,7 @@ pub fn app_icon(size: f32) -> egui::Image<'static> {
 }
 
 /// Run an action; a panic is logged and swallowed so one bad action never takes the app down.
-/// The configured backends and the ones chosen to build and to extract (read off the UI thread).
+/// The configured backends and the ones chosen to build, to extract, and to review (read off the UI thread).
 pub(crate) fn backends(hub: &AiHub) -> Done {
     // Numbered before reading: a snapshot read after a save always outnumbers one read before it.
     static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -2268,6 +2313,8 @@ pub(crate) fn backends(hub: &AiHub) -> Done {
         hub.backends(),
         hub.chosen(craft_anything_ai::Role::Builder),
         hub.chosen(craft_anything_ai::Role::Extractor),
+        hub.chosen(craft_anything_ai::Role::Reviewer),
+        hub.reviewer_model(),
         hub.options(),
         hub.replaced_programs(),
     )
@@ -2430,7 +2477,7 @@ mod backend_snapshot_tests {
                 ssh_host: None,
                 enabled: true,
             };
-            Done::Backends(read, vec![backend], None, None, Default::default(), Default::default())
+            Done::Backends(read, vec![backend], None, None, None, None, Default::default(), Default::default())
         };
         app.handle_done(jobs::Finished { job: 1, result: Ok(snapshot(10, "New")) });
         app.handle_done(jobs::Finished { job: 2, result: Ok(snapshot(5, "Old")) });

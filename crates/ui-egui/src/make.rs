@@ -157,7 +157,17 @@ pub fn hero(app: &mut CraftApp, ui: &mut Ui, w: f32) {
         engine_choices(app, ui);
         ui.add_space(theme::space::LG);
         ui.horizontal(|ui| {
-            crate::builders::built_by(app, ui);
+            ui.vertical(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    crate::builders::built_by(app, ui);
+                });
+                if !app.reviewer_choices().is_empty() || app.reviewer.is_some() {
+                    ui.add_space(theme::space::XS);
+                    ui.horizontal_wrapped(|ui| {
+                        crate::builders::reviewed_by(app, ui);
+                    });
+                }
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let ready = !app.state.make.request.trim().is_empty()
                     && url_problem(&app.state.make.url).is_none()
@@ -223,7 +233,17 @@ fn mine(app: &mut CraftApp, ui: &mut Ui, w: f32) {
         engine_choices(app, ui);
         ui.add_space(theme::space::LG);
         ui.horizontal(|ui| {
-            crate::builders::built_by(app, ui);
+            ui.vertical(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    crate::builders::built_by(app, ui);
+                });
+                if !app.reviewer_choices().is_empty() || app.reviewer.is_some() {
+                    ui.add_space(theme::space::XS);
+                    ui.horizontal_wrapped(|ui| {
+                        crate::builders::reviewed_by(app, ui);
+                    });
+                }
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let said = !app.state.make.request.trim().is_empty();
                 let ready = folder.is_some() && said && app.creating.is_none();

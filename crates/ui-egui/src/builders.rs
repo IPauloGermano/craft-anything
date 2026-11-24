@@ -124,6 +124,44 @@ impl CraftApp {
         set_up.chain(found).collect()
     }
 
+    /// Every AI that can act as a blind visual critic: enabled supported backends, then local
+    /// supported agent apps found on this computer.
+    pub fn reviewer_choices(&self) -> Vec<Choice> {
+        let set_up = self.backends.iter().filter(|b| b.enabled && craft_anything_ai::supports_reviewer(b)).map(|b| Choice {
+            name: b.name.clone(),
+            detail: detail(b),
+            found: false,
+        });
+        let found =
+            self.found_agents().filter(|b| craft_anything_ai::supports_reviewer(b)).map(|b| Choice { name: b.name.clone(), detail: detail(b), found: true });
+        set_up.chain(found).collect()
+    }
+
+    /// Choose (or clear, with `None`) the blind visual critic backend, setting up a locally
+    /// detected agent app on a worker thread when needed.
+    pub fn choose_reviewer(&mut self, wanted: Option<String>) {
+        self.reviewer_model_picker = None;
+        let Some(name) = wanted else {
+            return self.set_role(craft_anything_ai::Role::Reviewer, None);
+        };
+        let found = self.found_agents().find(|b| b.name == name).cloned();
+        if let Some(found) = found {
+            let saved = self.backends.iter().any(|b| b.name == found.name);
+            let hub = self.hub.clone();
+            self.jobs.spawn(tr("Choose an AI's job"), true, move |_| {
+                if saved {
+                    hub.set_enabled(&found.name, true).map_err(|e| e.message)?;
+                } else {
+                    hub.add_backend(found.clone(), None).map_err(|e| e.message)?;
+                }
+                hub.set_role(craft_anything_ai::Role::Reviewer, Some(&found.name)).map_err(|e| e.message)?;
+                Ok(crate::backends(&hub))
+            });
+            return;
+        }
+        self.set_role(craft_anything_ai::Role::Reviewer, Some(name));
+    }
+
     /// What builds when the person doesn't choose: the default from Settings → AI, else an agent
     /// app found on this computer.
     pub fn default_builder(&self) -> Option<String> {
@@ -188,6 +226,16 @@ impl CraftApp {
         self.jobs.spawn(tr("List an AI's models"), false, move |_| {
             let result = hub.model_choices(&name);
             Ok(crate::Done::ModelChoices { name, result })
+        });
+    }
+
+    /// Ask the chosen reviewer backend which models it offers, for the critic model picker.
+    pub fn pick_reviewer_model(&mut self, name: &str) {
+        let (hub, name) = (self.hub.clone(), name.to_string());
+        self.reviewer_model_picker = Some((name.clone(), None));
+        self.jobs.spawn(tr("List an AI's models"), false, move |_| {
+            let result = hub.model_choices(&name);
+            Ok(crate::Done::ReviewerModelChoices { name, result })
         });
     }
 
@@ -407,6 +455,93 @@ pub fn built_by(app: &mut CraftApp, ui: &mut Ui) {
     widgets::named(r.response, "Built by");
     if let Some(p) = pick {
         app.state.make.ai = p;
+    }
+}
+
+/// Inline picker for the blind visual critic's model override (shared between Settings → AI and
+/// Make). Lets a user choose a different model from the reviewer backend than the builder uses.
+pub fn reviewer_model_control(app: &mut CraftApp, ui: &mut Ui) {
+    let t = Tokens::get(ui.ctx());
+    let Some(rev_name) = app.reviewer.clone() else { return };
+    let Some(rev_cfg) = app.backends.iter().find(|b| b.name == rev_name && b.enabled).cloned() else { return };
+    let Some(backend_model) = craft_anything_ai::model_in_use(&rev_cfg, app.backend_options.get(&rev_name)) else { return };
+    let current = app.reviewer_model.clone().unwrap_or_else(|| trf("Same as backend ({model})", &[("model", &backend_model)]));
+    let mut start_pick = false;
+    let mut chosen: Option<Option<String>> = None;
+    let mut close = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.add(egui::Label::new(RichText::new(trf("Model: {model}", &[("model", &current)])).color(t.text_faint).size(theme::CAPTION)).truncate());
+        match app.reviewer_model_picker.as_ref().filter(|(n, _)| *n == rev_name) {
+            None => {
+                if widgets::caption_link(ui, "Change…").clicked() {
+                    start_pick = true;
+                }
+            }
+            Some((_, None)) => {
+                ui.add(crate::widgets::Spinner::new().size(theme::CAPTION).color(t.accent));
+                ui.label(RichText::new(tr("Asking for its models…")).color(t.text_faint).size(theme::CAPTION));
+            }
+            Some((_, Some(models))) => {
+                let same_label = tr("Same as backend");
+                let selected = app.reviewer_model.as_deref().unwrap_or(&same_label);
+                let r = widgets::dropdown(("visual-critic-model", &rev_name)).selected_text(selected).show_ui(ui, |ui| {
+                    if widgets::menu_item(ui, app.reviewer_model.is_none(), &same_label).clicked() && app.reviewer_model.is_some() {
+                        chosen = Some(None);
+                    }
+                    for m in models.iter().filter(|m| m.as_str() != craft_anything_ai::anthropic::CLAUDE_CODE_DEFAULT) {
+                        if widgets::menu_item(ui, app.reviewer_model.as_deref() == Some(m.as_str()), m).clicked()
+                            && app.reviewer_model.as_deref() != Some(m.as_str())
+                        {
+                            chosen = Some(Some(m.clone()));
+                        }
+                    }
+                });
+                widgets::named(r.response, "Critic model");
+                if widgets::caption_link(ui, "Cancel").clicked() {
+                    close = true;
+                }
+            }
+        }
+    });
+    if start_pick {
+        app.pick_reviewer_model(&rev_name);
+    }
+    if let Some(model) = chosen {
+        app.set_reviewer_model(model);
+    }
+    if close {
+        app.reviewer_model_picker = None;
+    }
+}
+
+/// "Visual critic" on Make: which AI (and optionally which model on that AI) reviews screenshots
+/// after each check round as an independent blind visual critic.
+pub fn reviewed_by(app: &mut CraftApp, ui: &mut Ui) {
+    let choices = app.reviewer_choices();
+    if choices.is_empty() && app.reviewer.is_none() {
+        return;
+    }
+    let t = Tokens::get(ui.ctx());
+    let shown = app.reviewer.clone().unwrap_or_else(|| tr("Off"));
+    ui.label(RichText::new(tr("Visual critic")).size(theme::BODY).color(t.text_dim));
+    let mut pick: Option<Option<String>> = None;
+    let r = widgets::dropdown("reviewed-by").selected_text(shown).width(220.0).show_ui(ui, |ui| {
+        if widgets::menu_item(ui, app.reviewer.is_none(), tr("Off")).on_hover_text(tr("No blind visual review.")).clicked() && app.reviewer.is_some() {
+            pick = Some(None);
+        }
+        for c in &choices {
+            let note = if c.found { format!("{} · {}", c.detail, tr("found on this computer; set up when you start")) } else { c.detail.clone() };
+            if widgets::menu_item(ui, app.reviewer.as_ref() == Some(&c.name), &c.name).on_hover_text(note).clicked() && app.reviewer.as_ref() != Some(&c.name) {
+                pick = Some(Some(c.name.clone()));
+            }
+        }
+    });
+    widgets::named(r.response, "Visual critic");
+    if let Some(p) = pick {
+        app.choose_reviewer(p);
+    }
+    if app.reviewer.is_some() {
+        reviewer_model_control(app, ui);
     }
 }
 

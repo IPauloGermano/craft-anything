@@ -370,12 +370,41 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     crate::engine_ui::assets_settings(app, ui);
     ui.add_space(theme::space::LG);
+    let critic_choices = app.reviewer_choices();
+    let mut critic_pick: Option<Option<String>> = None;
+    row(ui, "Blind visual critic", "Reviews screenshots after each check round with no access to source code.", |ui| {
+        ui.vertical(|ui| {
+            let shown = app.reviewer.clone().unwrap_or_else(|| tr("Off"));
+            let r = widgets::dropdown("visual-critic-backend").selected_text(shown).width(240.0).show_ui(ui, |ui| {
+                if widgets::menu_item(ui, app.reviewer.is_none(), tr("Off")).on_hover_text(tr("No blind visual review.")).clicked() && app.reviewer.is_some() {
+                    critic_pick = Some(None);
+                }
+                for c in &critic_choices {
+                    let note = if c.found { format!("{} · {}", c.detail, tr("found on this computer; set up when you start")) } else { c.detail.clone() };
+                    if widgets::menu_item(ui, app.reviewer.as_ref() == Some(&c.name), &c.name).on_hover_text(note).clicked()
+                        && app.reviewer.as_ref() != Some(&c.name)
+                    {
+                        critic_pick = Some(Some(c.name.clone()));
+                    }
+                }
+            });
+            widgets::named(r.response, "Blind visual critic");
+            if app.reviewer.is_some() {
+                ui.add_space(theme::space::XS);
+                crate::builders::reviewer_model_control(app, ui);
+            }
+        });
+    });
+    if let Some(pick) = critic_pick {
+        app.choose_reviewer(pick);
+    }
+    ui.add_space(theme::space::MD);
     widgets::caption(ui, "Your brains");
     ui.add_space(theme::space::XS);
     if app.backends.is_empty() {
         ui.label(RichText::new(tr("No AI is set up yet. The built-in engines still work; an AI adds plain-words answers.")).color(t.text_dim));
     }
-    let (mut pick, mut builds, mut extracts, mut toggle, mut remove) = (None, None, None, None, None);
+    let (mut pick, mut builds, mut extracts, mut reviews, mut toggle, mut remove) = (None, None, None, None, None, None);
     let (mut choose_program, mut usual_program, mut use_program) = (None, None, None);
     let mut check_agent = None;
     let mut save_folder = None;
@@ -753,6 +782,17 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
                 } else if b.enabled && widgets::secondary(ui, None, "Build with this").clicked() {
                     builds = Some(Some(b.name.clone()));
                 }
+                // Who reviews screenshots and motion burst frames as an independent blind visual critic.
+                if app.reviewer.as_ref() == Some(&b.name) {
+                    if widgets::secondary(ui, Some("scan-search"), "Reviews")
+                        .on_hover_text(tr("After each check round this one reviews screenshots as a blind visual critic. Click to stop."))
+                        .clicked()
+                    {
+                        reviews = Some(None);
+                    }
+                } else if b.enabled && craft_anything_ai::supports_reviewer(b) && widgets::secondary(ui, None, "Review with this").clicked() {
+                    reviews = Some(Some(b.name.clone()));
+                }
                 // Who takes a game's files out in Deep mode (an API backend, e.g. Kimi K3).
                 if b.kind != BackendKind::AgentCli {
                     if app.extractor.as_ref() == Some(&b.name) {
@@ -886,6 +926,9 @@ fn ai(app: &mut CraftApp, ui: &mut Ui) {
     }
     if let Some(e) = extracts {
         app.set_role(craft_anything_ai::Role::Extractor, e);
+    }
+    if let Some(r) = reviews {
+        app.set_role(craft_anything_ai::Role::Reviewer, r);
     }
     ui.add_space(theme::space::SM);
     let detected = app.detected.clone().unwrap_or_default();
@@ -2020,5 +2063,33 @@ mod model_options_tests {
         assert!(text.contains("new-model") && text.contains("Context window") && text.contains("Thinking depth"), "{text}");
         assert_eq!(app.model_tuning["Copilot test"].cli_model.as_deref(), Some("new-model"));
         assert_eq!(app.model_tuning["Copilot test"].error, None);
+    }
+
+    #[test]
+    fn blind_visual_critic_selector_offers_antigravity_and_critic_model_override() {
+        let mut app = app_with_backend();
+        app.backends = vec![craft_anything_ai::BackendConfig {
+            name: "Antigravity".into(),
+            kind: craft_anything_ai::BackendKind::AgentCli,
+            model: "antigravity".into(),
+            base_url: None,
+            ssh_host: None,
+            enabled: true,
+        }];
+        app.hub.add_backend(app.backends[0].clone(), None).unwrap();
+        assert!(app.reviewer_choices().iter().any(|c| c.name == "Antigravity"));
+
+        let text = render(&mut app);
+        assert!(text.contains("Blind visual critic") && text.contains("Antigravity default") && text.contains("Review with this"), "{text}");
+
+        app.hub.set_role(craft_anything_ai::Role::Reviewer, Some("Antigravity")).unwrap();
+        app.hub.set_reviewer_model(Some("gemini-3.8-flash-high")).unwrap();
+        let snapshot = crate::backends(&app.hub);
+        app.handle_done(crate::jobs::Finished { job: 0, result: Ok(snapshot) });
+        assert_eq!(app.reviewer.as_deref(), Some("Antigravity"));
+        assert_eq!(app.reviewer_model.as_deref(), Some("gemini-3.8-flash-high"));
+
+        let text = render(&mut app);
+        assert!(text.contains("Blind visual critic") && text.contains("gemini-3.8-flash-high") && text.contains("Reviews"), "{text}");
     }
 }

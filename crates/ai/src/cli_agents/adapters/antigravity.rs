@@ -2,14 +2,169 @@
 //!
 //! Antigravity runs prompts non-interactively with `--output-format stream-json -p <prompt>`.
 //! In builder mode, `--dangerously-skip-permissions` is passed so tool requests proceed without prompting.
+//! In blind visual review mode, Antigravity is locked down to the staged review directory via a
+//! tool-restricted workspace custom agent (`--agent`), session-only `--settings` denying writes,
+//! shell commands, URLs, and MCP tools with `allowNonWorkspaceAccess: false`, `--disable-slash-commands`,
+//! and a workspace `PreToolUse` hook (`craft-anything-cli blind-review-guard`) that denies any tool
+//! call other than reading direct staged files inside the review folder.
 
 use super::*;
+
+/// Name of the workspace custom agent staged inside the temporary blind-review folder.
+pub(crate) const BLIND_REVIEW_AGENT: &str = "craft-anything-blind-critic";
+
+/// Workspace custom agent definition restricting Antigravity's declared tools to read-only file
+/// viewing (`view_file`), disabling subagents, command execution, MCP servers, skills, and plugins.
+const BLIND_REVIEW_AGENT_MD: &str = "\
+---\n\
+name: craft-anything-blind-critic\n\
+description: Code-blind visual reviewer limited to inspecting staged screenshots.\n\
+tools:\n\
+  - view_file\n\
+mainAgent: true\n\
+subagent: false\n\
+commandExecutionPolicy: off\n\
+mcpServers: []\n\
+skills: []\n\
+plugins: []\n\
+---\n\
+You are an independent, code-blind visual quality critic.\n\
+Inspect only the staged image and diff files in the current directory and follow the user's review instructions strictly.\n";
+
+/// Session-only `--settings` JSON enforcing default mode, `request-review` tool permissions,
+/// no non-workspace access, disabled slash commands, and explicit deny rules for writes,
+/// commands, URLs, and MCP tools (deny rules override any global or shared allow rules).
+pub(crate) fn blind_review_settings() -> String {
+    json!({
+        "agentMode": "",
+        "toolPermission": "request-review",
+        "allowNonWorkspaceAccess": false,
+        "disableSlashCommands": true,
+        "permissions": {
+            "allow": [],
+            "ask": [],
+            "deny": [
+                "write_file(*)",
+                "command(*)",
+                "unsandboxed(*)",
+                "read_url(*)",
+                "execute_url(*)",
+                "mcp(*)"
+            ]
+        }
+    })
+    .to_string()
+}
+
+fn blind_review_hook_command(cli: &Path, review_dir: &Path) -> String {
+    #[cfg(windows)]
+    {
+        format!("\"{}\" blind-review-guard \"{}\"", cli.display(), review_dir.display())
+    }
+    #[cfg(not(windows))]
+    {
+        format!("{} blind-review-guard {}", crate::ssh::shell_quote(&cli.display().to_string()), crate::ssh::shell_quote(&review_dir.display().to_string()))
+    }
+}
+
+pub(crate) fn prepare_blind_review_dir_with_cli(review_dir: &Path, cli: &Path) -> Result<(), ToolError> {
+    let agents_root = review_dir.join(".agents");
+    let agent_dir = agents_root.join("agents").join(BLIND_REVIEW_AGENT);
+    std::fs::create_dir_all(&agent_dir).map_err(|e| ToolError::io(agent_dir.display(), e))?;
+    let agent_md = agent_dir.join("agent.md");
+    std::fs::write(&agent_md, BLIND_REVIEW_AGENT_MD).map_err(|e| ToolError::io(agent_md.display(), e))?;
+
+    let hooks = json!({
+        "craft-anything-blind-guard": {
+            "PreToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": blind_review_hook_command(cli, review_dir),
+                            "timeout": 10
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+    let hooks_bytes = serde_json::to_vec_pretty(&hooks).map_err(|e| ToolError::internal(e.to_string()))?;
+    let hooks_path = agents_root.join("hooks.json");
+    std::fs::write(&hooks_path, hooks_bytes).map_err(|e| ToolError::io(hooks_path.display(), e))?;
+    Ok(())
+}
+
+/// Parse `agy models` tab-separated output (`<slug>\t<display name>`) into model slugs.
+fn antigravity_models(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some((slug, _label)) = line.split_once('\t') else { continue };
+        let slug = slug.trim();
+        if !slug.is_empty() && !slug.chars().any(char::is_whitespace) && !out.iter().any(|s| s == slug) {
+            out.push(slug.to_string());
+        }
+    }
+    out
+}
 
 pub struct Antigravity;
 
 impl AgentAdapter for Antigravity {
     fn ids(&self) -> &'static [&'static str] {
         &["antigravity", "agy"]
+    }
+
+    fn supports_blind_review(&self) -> bool {
+        true
+    }
+
+    fn model_in_use(&self, options: Option<&BackendOptions>) -> Option<String> {
+        Some(options.and_then(|o| o.cli_model.clone()).unwrap_or_else(|| "Antigravity default".into()))
+    }
+
+    /// Antigravity's own model list (`agy models`), after its own default.
+    fn model_choices(&self, config: &BackendConfig, options: &BackendOptions) -> Result<Vec<String>, ToolError> {
+        let program = super::program_of(config, options)?;
+        let ask = [program, "models".into()];
+        let p = match config.ssh_host.as_deref().filter(|h| !h.trim().is_empty()) {
+            Some(h) => Process::new("ssh").args(crate::ssh::ssh_args(h, &ask)),
+            None => Process::new(&ask[0]).args(&ask[1..]),
+        };
+        let out = p.timeout(Duration::from_secs(15)).stdout_cap(2 * 1024 * 1024).run_checked()?;
+        let mut models = vec![crate::anthropic::CLAUDE_CODE_DEFAULT.to_string()];
+        models.extend(antigravity_models(&out.stdout_text()));
+        Ok(models)
+    }
+
+    fn offers_own_default(&self) -> bool {
+        true
+    }
+
+    fn blind_review_required_flags(&self) -> (&'static [&'static str], &'static [&'static str]) {
+        (&["--help"], &["--settings", "--agent", "--disable-slash-commands", "--output-format", "stream-json"])
+    }
+
+    fn prepare_blind_review_dir(&self, review_dir: &Path) -> Result<(), ToolError> {
+        let cli = craft_anything_platform::self_cli_path().ok_or_else(|| {
+            ToolError::new(ErrorCode::EngineMissing, "Couldn't find `craft-anything-cli` to enforce Antigravity's read-only blind-review hook.")
+                .with_remediation("Build or install `craft-anything-cli` next to Craft Anything (or on PATH), or choose another reviewer.")
+        })?;
+        prepare_blind_review_dir_with_cli(review_dir, &cli)
+    }
+
+    fn blind_review_args(&self, cx: &ArgsCx) -> Vec<String> {
+        // Deliberately omit `cx.options.args` (which may carry `--add-dir`, `--mode`,
+        // `--settings`, `--dangerously-skip-permissions`, or `--remote-agent`) and any
+        // `--conversation` resume id so every blind review runs statelessly inside the
+        // staged folder with read-only, tool-restricted settings.
+        let mut a = vec!["--settings".into(), blind_review_settings(), "--agent".into(), BLIND_REVIEW_AGENT.into(), "--disable-slash-commands".into()];
+        if let Some(m) = cx.options.cli_model.as_deref().filter(|m| !m.trim().is_empty()) {
+            a.extend(["--model".into(), m.to_string()]);
+        }
+        a.extend(["--output-format".into(), "stream-json".into(), "-p".into(), format!("{}{}", cx.preamble, cx.prompt)]);
+        a
     }
 
     fn args(&self, cx: &ArgsCx) -> Vec<String> {
@@ -305,5 +460,52 @@ mod tests {
         });
         let evs = p.line(&no_reply.to_string());
         assert!(matches!(evs[0], AgentEvent::Error { .. }), "an error with nothing delivered still fails the turn");
+    }
+
+    #[test]
+    fn blind_review_prepares_agent_and_hook_in_review_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let review_dir = d.path().join("review folder");
+        std::fs::create_dir_all(&review_dir).unwrap();
+        let cli = d.path().join("my bin").join("craft-anything-cli");
+
+        prepare_blind_review_dir_with_cli(&review_dir, &cli).unwrap();
+
+        let agent_md = std::fs::read_to_string(review_dir.join(".agents").join("agents").join(BLIND_REVIEW_AGENT).join("agent.md")).unwrap();
+        assert!(agent_md.contains("name: craft-anything-blind-critic") && agent_md.contains("- view_file"), "{agent_md}");
+        assert!(agent_md.contains("subagent: false") && agent_md.contains("commandExecutionPolicy: off"), "{agent_md}");
+
+        let hooks: Value = serde_json::from_slice(&std::fs::read(review_dir.join(".agents").join("hooks.json")).unwrap()).unwrap();
+        let entry = &hooks["craft-anything-blind-guard"]["PreToolUse"][0];
+        assert_eq!(entry["matcher"], "*");
+        let cmd = entry["hooks"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("blind-review-guard"), "{cmd}");
+        assert!(cmd.contains("craft-anything-cli") && cmd.contains("review folder"), "{cmd}");
+
+        assert!(Antigravity.supports_blind_review());
+        let (help, needed) = Antigravity.blind_review_required_flags();
+        assert_eq!(help, &["--help"]);
+        for flag in ["--settings", "--agent", "--disable-slash-commands", "--output-format", "stream-json"] {
+            assert!(needed.contains(&flag), "missing required blind-review flag {flag}");
+        }
+    }
+
+    #[test]
+    fn antigravity_offers_the_models_its_cli_lists() {
+        let out = "\
+Fetching available models...
+gemini-4-neon-high\tGemini 4 Neon (High)
+gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)
+gemini-4-neon-high\tGemini 4 Neon (High)
+bad line without tab
+has space\tInvalid
+\tMissing Slug
+claude-sonnet-5-5-high\tClaude Sonnet 5.5 (High)
+";
+        assert_eq!(antigravity_models(out), ["gemini-4-neon-high", "gemini-3.8-flash-medium", "claude-sonnet-5-5-high"]);
+        assert!(Antigravity.offers_own_default());
+        assert_eq!(Antigravity.model_in_use(None).as_deref(), Some("Antigravity default"));
+        let chosen = BackendOptions { cli_model: Some("gemini-3.8-flash-medium".into()), ..Default::default() };
+        assert_eq!(Antigravity.model_in_use(Some(&chosen)).as_deref(), Some("gemini-3.8-flash-medium"));
     }
 }

@@ -64,7 +64,7 @@ pub enum Command {
         /// Turn on web tools (web_site_open) in restricted mode.
         #[arg(long)]
         allow_web: bool,
-        /// Turn on capture tools (web_site_capture, web_page_states_capture) in restricted mode.
+        /// Turn on capture tools (web_site_capture, web_page_states_capture, web_page_motion_capture, web_webgl_webgpu_probe) in restricted mode.
         #[arg(long)]
         allow_capture: bool,
         /// A folder where questions and approvals for the person are posted (`core_person_ask`,
@@ -115,6 +115,9 @@ pub enum Command {
     /// added while it works (printed as the hook's JSON; nothing when none wait).
     #[command(hide = true)]
     BuilderNotes { dir: PathBuf },
+    /// For a blind visual critic's PreToolUse hook: allow only reading staged files inside `dir`.
+    #[command(hide = true)]
+    BlindReviewGuard { dir: PathBuf },
     /// Run a tool by name: `craft-anything-cli <tool> [path] [--key value] [--json '{..}' | @file.json | -]`.
     #[command(external_subcommand)]
     Tool(Vec<String>),
@@ -260,6 +263,14 @@ fn run(cli: Cli) -> u8 {
             if let Some(out) = notes::hook_output(&notes::claim(dir)) {
                 println!("{out}");
             }
+            0
+        }
+        // Runs before every tool call of a blind visual critic: fail-closed JSON decision on stdout.
+        Command::BlindReviewGuard { dir } => {
+            use std::io::Read as _;
+            let mut input = String::new();
+            let _ = std::io::stdin().take(1024 * 1024).read_to_string(&mut input);
+            println!("{}", craft_anything_ai::rebuild::critic::blind_review_guard_decision(dir, &input));
             0
         }
         Command::Mcp { all_tools, restricted, allow_web, allow_capture, inbox, targets } => {

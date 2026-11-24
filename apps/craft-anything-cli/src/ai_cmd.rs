@@ -110,6 +110,16 @@ pub enum AiCommand {
     /// Choose the backend that takes a game's own files out after the study, in Deep mode (an API
     /// backend such as Kimi K3 through OpenRouter; leave the name out to turn it off).
     Extractor { name: Option<String> },
+    /// Choose the backend (an agent app or an API vision backend) that acts as an independent
+    /// blind visual critic after each check round (sees only screenshots and motion burst frames,
+    /// never source code; leave the name out to turn it off).
+    Reviewer {
+        name: Option<String>,
+        /// Optional model override used only for the blind visual critic (leave out to use the
+        /// reviewer backend's configured model).
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 fn hub(cli: &Cli) -> Result<AiHub, ToolError> {
@@ -492,6 +502,21 @@ pub fn ai(cli: &Cli, c: &AiCommand, f: Format) -> u8 {
             }
             Err(e) => fail(&e, f),
         },
+        AiCommand::Reviewer { name, model } => {
+            if name.is_none() && model.is_some() {
+                return fail(&ToolError::invalid("Name a reviewer backend when passing `--model`."), f);
+            }
+            match hub
+                .set_role(craft_anything_ai::Role::Reviewer, name.as_deref())
+                .and_then(|()| if name.is_some() { hub.set_reviewer_model(model.as_deref()) } else { Ok(()) })
+            {
+                Ok(()) => {
+                    emit(&json!({"reviewer": name, "model": hub.reviewer_model()}), f);
+                    0
+                }
+                Err(e) => fail(&e, f),
+            }
+        }
         AiCommand::Test { name } => match hub.test_backend(name) {
             Ok(r) => {
                 emit(&serde_json::to_value(r).unwrap_or(Value::Null), f);

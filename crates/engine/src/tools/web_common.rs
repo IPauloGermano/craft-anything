@@ -8,6 +8,7 @@ use craft_anything_analysis::web_har::{contains_ascii_ci, encode_query, replace_
 use craft_anything_engines::cdp::{self, CdpClient, CdpEvent, Deadline, Endpoint, WsConn};
 use craft_anything_evidence::{Environment, ErrorCode, ToolError, host_triple, sha256_hex};
 use craft_anything_platform::process::{Process, RunningProcess, StdinMode};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -1153,36 +1154,24 @@ pub fn perceptual_similarity(a: &Image, b: &Image) -> f64 {
     perceptual_similarity_masked(a, b, None)
 }
 
-/// [`perceptual_similarity`] over the windows whose top-left pixel `mask` doesn't cover; 1.0
-/// when everything is masked.
-pub fn perceptual_similarity_masked(a: &Image, b: &Image, mask: Option<&NoiseMask>) -> f64 {
-    if a.width != b.width || a.height != b.height || a.width == 0 || a.height == 0 {
-        return 0.0;
+/// Composite an sRGB RGBA pixel over an opaque neutral mid-gray `[128, 128, 128]` background.
+/// Opaque pixels (`a == 255`) are returned unchanged, fully transparent pixels (`a == 0`) collapse
+/// to mid-gray regardless of hidden RGB bytes, and semi-transparent pixels contribute proportionally
+/// to their opacity so both black-vs-transparent and white-vs-transparent are distinguishable.
+fn composite_over_mid_gray(px: [u8; 4]) -> [u8; 3] {
+    let a = u16::from(px[3]);
+    if a == 255 {
+        return [px[0], px[1], px[2]];
     }
-    let f = a.width.max(a.height).div_ceil(512).max(1);
-    let (w, h) = (a.width.div_ceil(f) as usize, a.height.div_ceil(f) as usize);
-    let luma = |img: &Image| -> Vec<f64> {
-        let mut out = vec![0f64; w.saturating_mul(h)];
-        let mut n = vec![0u32; w.saturating_mul(h)];
-        for y in 0..img.height as usize {
-            for x in 0..img.width as usize {
-                let o = (y * img.width as usize + x) * 4;
-                if let Some(px) = img.rgba.get(o..o + 3) {
-                    let l = 0.299 * f64::from(px[0]) + 0.587 * f64::from(px[1]) + 0.114 * f64::from(px[2]);
-                    let i = (y / f as usize) * w + x / f as usize;
-                    if let (Some(s), Some(c)) = (out.get_mut(i), n.get_mut(i)) {
-                        *s += l;
-                        *c += 1;
-                    }
-                }
-            }
-        }
-        for (s, c) in out.iter_mut().zip(&n) {
-            *s /= f64::from((*c).max(1));
-        }
-        out
-    };
-    let (la, lb) = (luma(a), luma(b));
+    if a == 0 {
+        return [128, 128, 128];
+    }
+    let inv = 255 - a;
+    let blend = |c: u8| -> u8 { ((u16::from(c) * a + 128 * inv + 127) / 255) as u8 };
+    [blend(px[0]), blend(px[1]), blend(px[2])]
+}
+
+fn ssim_from_luma(la: &[f64], lb: &[f64], w: usize, h: usize, f: u32, mask: Option<&NoiseMask>) -> f64 {
     let (c1, c2) = ((0.01f64 * 255.0).powi(2), (0.03f64 * 255.0).powi(2));
     const WIN: usize = 8;
     let (mut total, mut windows, mut masked) = (0f64, 0u64, 0u64);
@@ -1225,6 +1214,40 @@ pub fn perceptual_similarity_masked(a: &Image, b: &Image, mask: Option<&NoiseMas
     }
 }
 
+/// [`perceptual_similarity`] over the windows whose top-left pixel `mask` doesn't cover; 1.0
+/// when everything is masked.
+pub fn perceptual_similarity_masked(a: &Image, b: &Image, mask: Option<&NoiseMask>) -> f64 {
+    if a.width != b.width || a.height != b.height || a.width == 0 || a.height == 0 {
+        return 0.0;
+    }
+    let f = a.width.max(a.height).div_ceil(512).max(1);
+    let (w, h) = (a.width.div_ceil(f) as usize, a.height.div_ceil(f) as usize);
+    let luma = |img: &Image| -> Vec<f64> {
+        let mut out = vec![0f64; w.saturating_mul(h)];
+        let mut n = vec![0u32; w.saturating_mul(h)];
+        for y in 0..img.height as usize {
+            for x in 0..img.width as usize {
+                let o = (y * img.width as usize + x) * 4;
+                if let Some(px) = img.rgba.get(o..o + 4) {
+                    let [r, g, b] = composite_over_mid_gray([px[0], px[1], px[2], px[3]]);
+                    let l = 0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b);
+                    let i = (y / f as usize) * w + x / f as usize;
+                    if let (Some(s), Some(c)) = (out.get_mut(i), n.get_mut(i)) {
+                        *s += l;
+                        *c += 1;
+                    }
+                }
+            }
+        }
+        for (s, c) in out.iter_mut().zip(&n) {
+            *s /= f64::from((*c).max(1));
+        }
+        out
+    };
+    let (la, lb) = (luma(a), luma(b));
+    ssim_from_luma(&la, &lb, w, h, f, mask)
+}
+
 /// Build the inline PNG screenshot artifact (with its sha256).
 pub fn png_artifact(bytes: &[u8]) -> Result<Value, ToolError> {
     if bytes.len() > MAX_SCREENSHOT_BYTES {
@@ -1239,6 +1262,811 @@ pub fn png_artifact(bytes: &[u8]) -> Result<Value, ToolError> {
         "sha256": sha256_hex(bytes),
         "base64": b64_encode(bytes),
     }))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Deterministic perceptual pixel diff: CIELAB Delta-E, region clustering and numbered heatmaps
+
+/// Default CIE76 Delta-E threshold above which a pixel counts as visually differing.
+pub const DEFAULT_DELTA_E_THRESHOLD: f64 = 2.5;
+/// Default minimum differing pixel count for a spatial cluster to be reported as a region.
+pub const DEFAULT_MIN_CLUSTER_PIXELS: usize = 32;
+/// Default maximum pixel gap between nearby boxes that are merged into one region.
+pub const DEFAULT_MERGE_GAP_PX: u32 = 16;
+/// Grid cell edge (pixels) used to seed connected difference components.
+const DIFF_CELL_SIZE: u32 = 8;
+
+/// Convert an 8-bit sRGB channel to linear light in `0.0..=1.0` (IEC 61966-2-1).
+fn srgb_channel_to_linear(c: u8) -> f64 {
+    let s = f64::from(c) / 255.0;
+    if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+}
+
+/// Build a 256-entry sRGB-to-linear lookup table for fast per-pixel conversion.
+fn build_srgb_lut() -> [f64; 256] {
+    let mut lut = [0.0f64; 256];
+    for (i, slot) in lut.iter_mut().enumerate() {
+        *slot = srgb_channel_to_linear(i as u8);
+    }
+    lut
+}
+
+/// CIE Lab transfer function `f(t)` with exact rational thresholds.
+fn lab_f(t: f64) -> f64 {
+    const EPSILON: f64 = 216.0 / 24389.0;
+    const KAPPA: f64 = 24389.0 / 27.0;
+    if t > EPSILON { t.cbrt() } else { (KAPPA * t + 16.0) / 116.0 }
+}
+
+/// Convert sRGB `(r, g, b)` to CIE `L*a*b*` under the D65 standard illuminant.
+pub fn rgb_to_lab(r: u8, g: u8, b: u8) -> (f64, f64, f64) {
+    linear_rgb_to_lab(srgb_channel_to_linear(r), srgb_channel_to_linear(g), srgb_channel_to_linear(b))
+}
+
+fn linear_rgb_to_lab(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
+    // sRGB to CIE XYZ (D65, 2-degree standard observer).
+    let x = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b;
+    let y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b;
+    let z = 0.0193339 * r + 0.1191920 * g + 0.9503041 * b;
+
+    // Normalise against D65 reference white (Xn=0.95047, Yn=1.00000, Zn=1.08883).
+    let fx = lab_f(x / 0.95047);
+    let fy = lab_f(y);
+    let fz = lab_f(z / 1.08883);
+
+    let l = 116.0 * fy - 16.0;
+    let a = 500.0 * (fx - fy);
+    let b_star = 200.0 * (fy - fz);
+    (l, a, b_star)
+}
+
+/// Perceptual CIE76 colour distance between two `L*a*b*` triplets.
+pub fn delta_e_cie76(lab1: (f64, f64, f64), lab2: (f64, f64, f64)) -> f64 {
+    let dl = lab1.0 - lab2.0;
+    let da = lab1.1 - lab2.1;
+    let db = lab1.2 - lab2.2;
+    (dl * dl + da * da + db * db).sqrt()
+}
+
+#[derive(Deserialize)]
+struct DiffRegionWire {
+    id: usize,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    pixel_count: usize,
+    mean_delta_e: f64,
+    max_delta_e: f64,
+    #[serde(default)]
+    ssim: f64,
+    severity: String,
+}
+
+impl TryFrom<DiffRegionWire> for DiffRegion {
+    type Error = String;
+
+    fn try_from(w: DiffRegionWire) -> Result<Self, Self::Error> {
+        let severity = match w.severity.as_str() {
+            "severe" => "severe",
+            "moderate" => "moderate",
+            "minor" => "minor",
+            other => return Err(format!("unknown severity {other:?}; expected severe, moderate, or minor")),
+        };
+        Ok(DiffRegion {
+            id: w.id,
+            x: w.x,
+            y: w.y,
+            width: w.width,
+            height: w.height,
+            pixel_count: w.pixel_count,
+            mean_delta_e: w.mean_delta_e,
+            max_delta_e: w.max_delta_e,
+            ssim: w.ssim,
+            severity,
+        })
+    }
+}
+
+/// One clustered divergence region detected between an original and rebuilt screenshot.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DiffRegion {
+    pub id: usize,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_count: usize,
+    pub mean_delta_e: f64,
+    pub max_delta_e: f64,
+    pub ssim: f64,
+    pub severity: &'static str,
+}
+
+impl<'de> Deserialize<'de> for DiffRegion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = DiffRegionWire::deserialize(deserializer)?;
+        DiffRegion::try_from(wire).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Configuration options for [`compute_pixel_diff_heatmap`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DiffOptions {
+    pub delta_e_threshold: f64,
+    pub min_cluster_pixels: usize,
+    pub merge_gap_px: u32,
+}
+
+impl Default for DiffOptions {
+    fn default() -> Self {
+        DiffOptions { delta_e_threshold: DEFAULT_DELTA_E_THRESHOLD, min_cluster_pixels: DEFAULT_MIN_CLUSTER_PIXELS, merge_gap_px: DEFAULT_MERGE_GAP_PX }
+    }
+}
+
+/// Complete deterministic pixel-diff output: global metrics, clustered regions, rendered heatmap PNG,
+/// and serialised geometric metadata JSON.
+#[derive(Debug, Clone)]
+pub struct PixelDiffReport {
+    pub width: u32,
+    pub height: u32,
+    pub original_width: u32,
+    pub original_height: u32,
+    pub built_width: u32,
+    pub built_height: u32,
+    pub ssim: f64,
+    pub mean_delta_e: f64,
+    pub max_delta_e: f64,
+    pub total_pixels: u64,
+    pub differing_pixels: u64,
+    pub difference_fraction: f64,
+    pub delta_e_threshold: f64,
+    pub regions: Vec<DiffRegion>,
+    pub heatmap_png: Vec<u8>,
+    pub diff_json: Value,
+}
+
+/// Read the RGBA pixel at `(x, y)` on a padded canvas, treating pixels outside `img` as `[0, 0, 0, 0]`.
+#[inline]
+fn padded_pixel(img: &Image, x: u32, y: u32) -> [u8; 4] {
+    if x < img.width && y < img.height {
+        let o = ((y as usize).saturating_mul(img.width as usize).saturating_add(x as usize)).saturating_mul(4);
+        if let Some(px) = img.rgba.get(o..o + 4) {
+            return [px[0], px[1], px[2], px[3]];
+        }
+    }
+    [0, 0, 0, 0]
+}
+
+/// [`perceptual_similarity`] over a rectangular sub-canvas without allocating padded or cropped copies.
+fn perceptual_similarity_rect(a: &Image, b: &Image, rect: PixelBox) -> f64 {
+    let rw = rect.x1.saturating_sub(rect.x0);
+    let rh = rect.y1.saturating_sub(rect.y0);
+    if rw == 0 || rh == 0 {
+        return 0.0;
+    }
+    let f = rw.max(rh).div_ceil(512).max(1);
+    let (w, h) = (rw.div_ceil(f) as usize, rh.div_ceil(f) as usize);
+    let f_usize = f as usize;
+    let luma = |img: &Image| -> Vec<f64> {
+        let mut out = vec![0f64; w.saturating_mul(h)];
+        let mut n = vec![0u32; w.saturating_mul(h)];
+        for dy in 0..rh {
+            let y = rect.y0.saturating_add(dy);
+            let row_bin = (dy as usize / f_usize).saturating_mul(w);
+            let in_y = y < img.height;
+            let src_row_base = (y as usize).saturating_mul(img.width as usize).saturating_mul(4);
+            for dx in 0..rw {
+                let x = rect.x0.saturating_add(dx);
+                let l = if in_y && x < img.width {
+                    let o = src_row_base.saturating_add((x as usize).saturating_mul(4));
+                    if let Some(px) = img.rgba.get(o..o + 4) {
+                        let [r, g, b] = composite_over_mid_gray([px[0], px[1], px[2], px[3]]);
+                        0.299 * f64::from(r) + 0.587 * f64::from(g) + 0.114 * f64::from(b)
+                    } else {
+                        128.0
+                    }
+                } else {
+                    128.0
+                };
+                let i = row_bin.saturating_add(dx as usize / f_usize);
+                if let (Some(s), Some(c)) = (out.get_mut(i), n.get_mut(i)) {
+                    *s += l;
+                    *c += 1;
+                }
+            }
+        }
+        for (s, c) in out.iter_mut().zip(&n) {
+            *s /= f64::from((*c).max(1));
+        }
+        out
+    };
+    let (la, lb) = (luma(a), luma(b));
+    ssim_from_luma(&la, &lb, w, h, f, None)
+}
+
+/// Axis-aligned pixel bounding box with exclusive right/bottom edges (`x0 < x1`, `y0 < y1`).
+#[derive(Debug, Clone, Copy)]
+struct PixelBox {
+    x0: u32,
+    y0: u32,
+    x1: u32,
+    y1: u32,
+}
+
+impl PixelBox {
+    fn union(self, other: PixelBox) -> PixelBox {
+        PixelBox { x0: self.x0.min(other.x0), y0: self.y0.min(other.y0), x1: self.x1.max(other.x1), y1: self.y1.max(other.y1) }
+    }
+
+    fn within_gap(self, other: PixelBox, gap: u32) -> bool {
+        let h_gap = other.x0.saturating_sub(self.x1).max(self.x0.saturating_sub(other.x1));
+        let v_gap = other.y0.saturating_sub(self.y1).max(self.y0.saturating_sub(other.y1));
+        h_gap <= gap && v_gap <= gap
+    }
+
+    fn intersects(self, other: PixelBox) -> bool {
+        self.x0 < other.x1 && other.x0 < self.x1 && self.y0 < other.y1 && other.y0 < self.y1
+    }
+}
+
+/// Per-8×8-cell summary of differing pixels accumulated during the single Delta-E pass so tall
+/// full-page diffs don't allocate a separate full-resolution `delta_matrix`.
+#[derive(Clone, Copy, Default)]
+struct DiffCell {
+    sum_de: f64,
+    max_de: f32,
+    count: u8,
+    min_x: u8,
+    min_y: u8,
+    max_x: u8,
+    max_y: u8,
+}
+
+const _: () = assert!(DIFF_CELL_SIZE * DIFF_CELL_SIZE <= u8::MAX as u32);
+
+impl DiffCell {
+    #[inline]
+    fn record(&mut self, lx: u8, ly: u8, de_f32: f32, de_measured: f64) {
+        if self.count == 0 {
+            self.min_x = lx;
+            self.min_y = ly;
+            self.max_x = lx;
+            self.max_y = ly;
+            self.max_de = de_f32;
+            self.sum_de = de_measured;
+            self.count = 1;
+        } else {
+            self.min_x = self.min_x.min(lx);
+            self.min_y = self.min_y.min(ly);
+            self.max_x = self.max_x.max(lx);
+            self.max_y = self.max_y.max(ly);
+            if de_f32 > self.max_de {
+                self.max_de = de_f32;
+            }
+            self.sum_de += de_measured;
+            self.count = self.count.saturating_add(1);
+        }
+    }
+}
+
+/// Cluster active grid cells into merged, noise-filtered, top-to-bottom / left-to-right [`DiffRegion`]s.
+fn detect_diff_regions_from_cells(
+    orig: &Image,
+    built: &Image,
+    canvas: (u32, u32),
+    grid: (u32, u32),
+    cells: &[DiffCell],
+    global_ssim: f64,
+    opts: DiffOptions,
+) -> Vec<DiffRegion> {
+    let (w, h) = canvas;
+    let (cols, rows) = grid;
+    if w == 0 || h == 0 || cols == 0 || rows == 0 {
+        return Vec::new();
+    }
+    let cell_count = (cols as usize).saturating_mul(rows as usize);
+
+    // 8-connected components over active grid cells via iterative BFS.
+    let mut visited = vec![false; cell_count];
+    let mut boxes: Vec<PixelBox> = Vec::new();
+    let mut queue: std::collections::VecDeque<(u32, u32)> = std::collections::VecDeque::new();
+
+    for cy in 0..rows {
+        for cx in 0..cols {
+            let idx = (cy as usize).saturating_mul(cols as usize).saturating_add(cx as usize);
+            if cells.get(idx).is_none_or(|c| c.count == 0) || visited.get(idx).copied().unwrap_or(true) {
+                continue;
+            }
+            if let Some(v) = visited.get_mut(idx) {
+                *v = true;
+            }
+            queue.push_back((cx, cy));
+            let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0u32, 0u32);
+            let mut found_px = false;
+
+            while let Some((ux, uy)) = queue.pop_front() {
+                let uidx = (uy as usize).saturating_mul(cols as usize).saturating_add(ux as usize);
+                if let Some(cell) = cells.get(uidx)
+                    && cell.count > 0
+                {
+                    let px0 = ux.saturating_mul(DIFF_CELL_SIZE);
+                    let py0 = uy.saturating_mul(DIFF_CELL_SIZE);
+                    min_x = min_x.min(px0.saturating_add(u32::from(cell.min_x)));
+                    min_y = min_y.min(py0.saturating_add(u32::from(cell.min_y)));
+                    max_x = max_x.max(px0.saturating_add(u32::from(cell.max_x)));
+                    max_y = max_y.max(py0.saturating_add(u32::from(cell.max_y)));
+                    found_px = true;
+                }
+                for dy in -1i64..=1 {
+                    for dx in -1i64..=1 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let nx = i64::from(ux) + dx;
+                        let ny = i64::from(uy) + dy;
+                        if nx < 0 || ny < 0 || nx >= i64::from(cols) || ny >= i64::from(rows) {
+                            continue;
+                        }
+                        let (nxu, nyu) = (nx as u32, ny as u32);
+                        let nidx = (nyu as usize).saturating_mul(cols as usize).saturating_add(nxu as usize);
+                        if cells.get(nidx).is_some_and(|c| c.count > 0) && !visited.get(nidx).copied().unwrap_or(true) {
+                            if let Some(v) = visited.get_mut(nidx) {
+                                *v = true;
+                            }
+                            queue.push_back((nxu, nyu));
+                        }
+                    }
+                }
+            }
+
+            if found_px {
+                boxes.push(PixelBox { x0: min_x, y0: min_y, x1: max_x.saturating_add(1), y1: max_y.saturating_add(1) });
+            }
+        }
+    }
+
+    // Merge nearby bounding boxes separated by <= merge_gap_px using a fixed-point sweep.
+    let gap = opts.merge_gap_px;
+    loop {
+        boxes.sort_by_key(|b| (b.y0, b.x0));
+        let mut merged_any = false;
+        let mut used = vec![false; boxes.len()];
+        let mut next: Vec<PixelBox> = Vec::with_capacity(boxes.len());
+        for i in 0..boxes.len() {
+            if used.get(i).copied().unwrap_or(true) {
+                continue;
+            }
+            let Some(&initial) = boxes.get(i) else { continue };
+            let mut cur = initial;
+            if let Some(u) = used.get_mut(i) {
+                *u = true;
+            }
+            let mut j = i + 1;
+            while j < boxes.len() {
+                if used.get(j).copied().unwrap_or(true) {
+                    j += 1;
+                    continue;
+                }
+                let Some(&cand) = boxes.get(j) else {
+                    j += 1;
+                    continue;
+                };
+                if cand.y0 > cur.y1.saturating_add(gap) {
+                    break;
+                }
+                if cur.within_gap(cand, gap) {
+                    cur = cur.union(cand);
+                    if let Some(u) = used.get_mut(j) {
+                        *u = true;
+                    }
+                    merged_any = true;
+                    j = i + 1;
+                } else {
+                    j += 1;
+                }
+            }
+            next.push(cur);
+        }
+        boxes = next;
+        if !merged_any {
+            break;
+        }
+    }
+
+    // Compute exact per-region metrics from the cell grid and drop noise clusters below min_cluster_pixels.
+    // Every active cell that contains any differing pixel inside `bx` belongs to a component
+    // merged into `bx`, so all of its differing pixels lie completely within `bx`.
+    let mut regions: Vec<DiffRegion> = Vec::new();
+    for bx in boxes {
+        let mut pixel_count = 0usize;
+        let mut sum_de = 0.0f64;
+        let mut max_de = 0.0f64;
+        let cx0 = bx.x0 / DIFF_CELL_SIZE;
+        let cy0 = bx.y0 / DIFF_CELL_SIZE;
+        let cx1 = bx.x1.div_ceil(DIFF_CELL_SIZE).min(cols);
+        let cy1 = bx.y1.div_ceil(DIFF_CELL_SIZE).min(rows);
+        for cy in cy0..cy1 {
+            let row_off = (cy as usize).saturating_mul(cols as usize);
+            let py0 = cy.saturating_mul(DIFF_CELL_SIZE);
+            for cx in cx0..cx1 {
+                let Some(cell) = cells.get(row_off.saturating_add(cx as usize)) else { continue };
+                if cell.count == 0 {
+                    continue;
+                }
+                let px0 = cx.saturating_mul(DIFF_CELL_SIZE);
+                let cell_x0 = px0.saturating_add(u32::from(cell.min_x));
+                let cell_y0 = py0.saturating_add(u32::from(cell.min_y));
+                let cell_x1 = px0.saturating_add(u32::from(cell.max_x)).saturating_add(1);
+                let cell_y1 = py0.saturating_add(u32::from(cell.max_y)).saturating_add(1);
+                if cell_x0 < bx.x0 || cell_x1 > bx.x1 || cell_y0 < bx.y0 || cell_y1 > bx.y1 {
+                    continue;
+                }
+                pixel_count += usize::from(cell.count);
+                sum_de += cell.sum_de;
+                let cell_max = f64::from(cell.max_de);
+                if cell_max > max_de {
+                    max_de = cell_max;
+                }
+            }
+        }
+        if pixel_count < opts.min_cluster_pixels {
+            continue;
+        }
+        let rw = bx.x1.saturating_sub(bx.x0);
+        let rh = bx.y1.saturating_sub(bx.y0);
+        let mean_de = sum_de / pixel_count as f64;
+        let ssim = if bx.x0 == 0 && bx.y0 == 0 && rw == w && rh == h { global_ssim } else { perceptual_similarity_rect(orig, built, bx) };
+        let severity = if mean_de > 20.0 || pixel_count > 5000 {
+            "severe"
+        } else if mean_de > 8.0 || pixel_count > 500 {
+            "moderate"
+        } else {
+            "minor"
+        };
+        regions.push(DiffRegion { id: 0, x: bx.x0, y: bx.y0, width: rw, height: rh, pixel_count, mean_delta_e: mean_de, max_delta_e: max_de, ssim, severity });
+    }
+
+    // Order top-to-bottom, left-to-right and assign sequential 1-based IDs.
+    regions.sort_by_key(|r| (r.y, r.x));
+    for (idx, r) in regions.iter_mut().enumerate() {
+        r.id = idx + 1;
+    }
+    regions
+}
+
+/// Embedded 5x7 bitmap glyphs for digits `0..=9` and brackets `[` / `]`.
+fn glyph_5x7(ch: char) -> [u8; 7] {
+    match ch {
+        '0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
+        '1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        '2' => [0x0E, 0x11, 0x01, 0x06, 0x08, 0x10, 0x1F],
+        '3' => [0x0E, 0x11, 0x01, 0x06, 0x01, 0x11, 0x0E],
+        '4' => [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
+        '5' => [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
+        '6' => [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
+        '7' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+        '8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
+        '9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
+        '[' => [0x0E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0E],
+        ']' => [0x0E, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0E],
+        _ => [0x00; 7],
+    }
+}
+
+fn put_pixel(img: &mut Image, x: u32, y: u32, color: [u8; 4]) {
+    if x >= img.width || y >= img.height {
+        return;
+    }
+    let off = ((y as usize).saturating_mul(img.width as usize).saturating_add(x as usize)).saturating_mul(4);
+    if let Some(px) = img.rgba.get_mut(off..off + 4) {
+        px.copy_from_slice(&color);
+    }
+}
+
+fn fill_rect(img: &mut Image, rect: PixelBox, color: [u8; 4]) {
+    let x0 = rect.x0.min(img.width);
+    let y0 = rect.y0.min(img.height);
+    let x1 = rect.x1.min(img.width);
+    let y1 = rect.y1.min(img.height);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            put_pixel(img, x, y, color);
+        }
+    }
+}
+
+fn draw_rect_border(img: &mut Image, rect: PixelBox, thickness: u32, color: [u8; 4]) {
+    let rw = rect.x1.saturating_sub(rect.x0);
+    let rh = rect.y1.saturating_sub(rect.y0);
+    if rw == 0 || rh == 0 || thickness == 0 {
+        return;
+    }
+    let t = thickness.min(rw).min(rh);
+    // Top and bottom edges.
+    fill_rect(img, PixelBox { x0: rect.x0, y0: rect.y0, x1: rect.x1, y1: rect.y0.saturating_add(t) }, color);
+    fill_rect(img, PixelBox { x0: rect.x0, y0: rect.y1.saturating_sub(t), x1: rect.x1, y1: rect.y1 }, color);
+    // Left and right edges.
+    fill_rect(img, PixelBox { x0: rect.x0, y0: rect.y0, x1: rect.x0.saturating_add(t), y1: rect.y1 }, color);
+    fill_rect(img, PixelBox { x0: rect.x1.saturating_sub(t), y0: rect.y0, x1: rect.x1, y1: rect.y1 }, color);
+}
+
+fn draw_badge(img: &mut Image, region: &DiffRegion, placed_badges: &mut Vec<PixelBox>) {
+    let mut label = format!("[{}]", region.id);
+    let mut scale: u32 = if img.width >= 320 && img.height >= 200 { 2 } else { 1 };
+    let mut pad = 2 * scale;
+    let measure = |lbl: &str, sc: u32, pd: u32| -> (u32, u32, u32) {
+        let step = 6 * sc;
+        let tw = (lbl.len() as u32).saturating_mul(step).saturating_sub(sc);
+        let th = 7 * sc;
+        (step, tw.saturating_add(pd.saturating_mul(2)), th.saturating_add(pd.saturating_mul(2)))
+    };
+    let (mut char_step, mut badge_w, mut badge_h) = measure(&label, scale, pad);
+    if badge_w > img.width {
+        // Ultra-narrow canvas: drop brackets and padding so the digit remains legible without
+        // resizing the heatmap image or shifting reported region coordinates.
+        label = region.id.to_string();
+        scale = 1;
+        pad = 0;
+        (char_step, badge_w, badge_h) = measure(&label, scale, pad);
+    }
+
+    let max_bx = img.width.saturating_sub(badge_w);
+    let max_by = img.height.saturating_sub(badge_h);
+    let base_x = region.x.min(max_bx);
+    let above_y = if region.y >= badge_h { region.y - badge_h } else { region.y.min(max_by) };
+
+    let horiz = std::iter::successors(Some(base_x), move |&cx| (cx < max_bx).then(|| (cx + 4).min(max_bx))).map(move |cx| (cx, above_y));
+    let fixed = [(base_x, region.y.min(max_by)), (base_x, region.y.saturating_add(region.height).min(max_by))].into_iter();
+    let step_y = badge_h.saturating_add(2).max(1);
+    let vert = std::iter::successors(Some(region.y.min(max_by)), move |&cy| (cy < max_by).then(|| (cy + step_y).min(max_by))).map(move |cy| (base_x, cy));
+
+    let badge_rect = horiz
+        .chain(fixed)
+        .chain(vert)
+        .map(|(bx, by)| PixelBox { x0: bx, y0: by, x1: bx.saturating_add(badge_w), y1: by.saturating_add(badge_h) })
+        .find(|rect| !placed_badges.iter().any(|p| p.intersects(*rect)))
+        .unwrap_or(PixelBox { x0: base_x, y0: above_y, x1: base_x.saturating_add(badge_w), y1: above_y.saturating_add(badge_h) });
+    placed_badges.push(badge_rect);
+    let (bx, by) = (badge_rect.x0, badge_rect.y0);
+
+    // Solid red badge with white border for readability over both light and thermal areas.
+    fill_rect(img, badge_rect, [220, 20, 20, 255]);
+    draw_rect_border(img, badge_rect, 1, [255, 255, 255, 255]);
+
+    for (ci, ch) in label.chars().enumerate() {
+        let bitmap = glyph_5x7(ch);
+        let gx0 = bx.saturating_add(pad).saturating_add((ci as u32).saturating_mul(char_step));
+        let gy0 = by.saturating_add(pad);
+        for (row_idx, &bits) in bitmap.iter().enumerate() {
+            for col_idx in 0..5u32 {
+                if (bits & (1u8 << (4 - col_idx))) != 0 {
+                    let px = gx0.saturating_add(col_idx.saturating_mul(scale));
+                    let py = gy0.saturating_add((row_idx as u32).saturating_mul(scale));
+                    fill_rect(img, PixelBox { x0: px, y0: py, x1: px.saturating_add(scale), y1: py.saturating_add(scale) }, [255, 255, 255, 255]);
+                }
+            }
+        }
+    }
+}
+
+/// Map a Delta-E magnitude above `threshold` onto a yellow -> orange -> red -> magenta thermal ramp.
+fn thermal_color(delta_e: f64, threshold: f64) -> ([u8; 3], f64) {
+    let span = (50.0 - threshold).max(1.0);
+    let t = ((delta_e - threshold) / span).clamp(0.0, 1.0);
+    let lerp = |a: u8, b: u8, f: f64| -> u8 { (f64::from(a) + (f64::from(b) - f64::from(a)) * f).round().clamp(0.0, 255.0) as u8 };
+    let rgb = if t < 0.35 {
+        let f = t / 0.35;
+        [255, lerp(225, 130, f), 0]
+    } else if t < 0.70 {
+        let f = (t - 0.35) / 0.35;
+        [lerp(255, 235, f), lerp(130, 25, f), lerp(0, 20, f)]
+    } else {
+        let f = (t - 0.70) / 0.30;
+        [lerp(235, 220, f), lerp(25, 0, f), lerp(20, 200, f)]
+    };
+    let alpha = 0.55 + 0.35 * t;
+    (rgb, alpha)
+}
+
+#[inline]
+fn blend_heatmap_pixel(src_rgb: [u8; 3], de_f32: f32, thresh_f32: f32, thresh_f64: f64) -> [u8; 4] {
+    let [sr, sg, sb] = src_rgb;
+    let luma = 0.299 * f64::from(sr) + 0.587 * f64::from(sg) + 0.114 * f64::from(sb);
+    // 40% saturation / 60% grayscale, gently compressed so bright thermal highlights stand out.
+    let mut r = (0.4 * f64::from(sr) + 0.6 * luma) * 0.88;
+    let mut g = (0.4 * f64::from(sg) + 0.6 * luma) * 0.88;
+    let mut b = (0.4 * f64::from(sb) + 0.6 * luma) * 0.88;
+
+    if de_f32 > thresh_f32 {
+        let (heat, alpha) = thermal_color(f64::from(de_f32), thresh_f64);
+        let inv = 1.0 - alpha;
+        r = r * inv + f64::from(heat[0]) * alpha;
+        g = g * inv + f64::from(heat[1]) * alpha;
+        b = b * inv + f64::from(heat[2]) * alpha;
+    }
+    [r.round().clamp(0.0, 255.0) as u8, g.round().clamp(0.0, 255.0) as u8, b.round().clamp(0.0, 255.0) as u8, 255]
+}
+
+fn draw_regions_and_badges(img: &mut Image, regions: &[DiffRegion]) {
+    // Draw 2px bright red bounding boxes, then draw numeric badges on top so badges are never occluded.
+    for region in regions {
+        let rect = PixelBox { x0: region.x, y0: region.y, x1: region.x.saturating_add(region.width), y1: region.y.saturating_add(region.height) };
+        draw_rect_border(img, rect, 2, [235, 25, 25, 255]);
+    }
+    let mut placed_badges: Vec<PixelBox> = Vec::with_capacity(regions.len());
+    for region in regions {
+        draw_badge(img, region, &mut placed_badges);
+    }
+}
+
+/// Render a composite visual diff heatmap with a desaturated base layer, thermal divergence overlay,
+/// 2px red region bounding boxes, and numbered `[1]`, `[2]`, ... badges.
+pub fn render_diff_heatmap(orig: &Image, built: &Image, regions: &[DiffRegion], delta_matrix: &[f32]) -> Image {
+    render_diff_heatmap_with_threshold(orig, built, regions, delta_matrix, DEFAULT_DELTA_E_THRESHOLD)
+}
+
+fn render_diff_heatmap_with_threshold(orig: &Image, built: &Image, regions: &[DiffRegion], delta_matrix: &[f32], threshold: f64) -> Image {
+    let w = orig.width.max(built.width);
+    let h = orig.height.max(built.height);
+    let pixels = (w as usize).saturating_mul(h as usize);
+    let mut rgba = vec![0u8; pixels.saturating_mul(4)];
+    let thresh_f32 = threshold as f32;
+    let thresh_f64 = f64::from(thresh_f32);
+
+    for y in 0..h {
+        let row_i = (y as usize).saturating_mul(w as usize);
+        for x in 0..w {
+            let i = row_i.saturating_add(x as usize);
+            let off = i.saturating_mul(4);
+            // Show desaturated built image for context; outside built's original bounds, show original context.
+            let src =
+                if (x >= built.width || y >= built.height) && x < orig.width && y < orig.height { padded_pixel(orig, x, y) } else { padded_pixel(built, x, y) };
+            let src_rgb = composite_over_mid_gray(src);
+            let de_f32 = delta_matrix.get(i).copied().unwrap_or(0.0);
+            if let Some(dst) = rgba.get_mut(off..off + 4) {
+                dst.copy_from_slice(&blend_heatmap_pixel(src_rgb, de_f32, thresh_f32, thresh_f64));
+            }
+        }
+    }
+
+    let mut img = Image { width: w, height: h, rgba };
+    draw_regions_and_badges(&mut img, regions);
+    img
+}
+
+/// Compute global SSIM, per-pixel CIELAB CIE76 Delta-E, clustered divergence regions, a composite
+/// numbered heatmap PNG, and structured geometric JSON metadata between `orig` and `built`.
+pub fn compute_pixel_diff_heatmap(orig: &Image, built: &Image, opts: DiffOptions) -> Result<PixelDiffReport, ToolError> {
+    if orig.width == 0 || orig.height == 0 || built.width == 0 || built.height == 0 {
+        return Err(ToolError::invalid("cannot compute visual diff for an empty image"));
+    }
+    if !opts.delta_e_threshold.is_finite() || opts.delta_e_threshold < 0.0 {
+        return Err(ToolError::invalid("delta_e_threshold must be a finite non-negative number"));
+    }
+    let w = orig.width.max(built.width);
+    let h = orig.height.max(built.height);
+    let total_pixels = (w as u64).saturating_mul(h as u64);
+    let cols = w.div_ceil(DIFF_CELL_SIZE);
+    let rows = h.div_ceil(DIFF_CELL_SIZE);
+    let cell_count = (cols as u64).saturating_mul(rows as u64);
+    // Single-pass diff allocates only the output RGBA heatmap plus the 8×8 cell summary grid and
+    // BFS visited flags (no padded image copies or per-pixel Delta-E buffer), so tall full-page
+    // captures such as 1440×12000 stay well within MAX_PIXELS_WORKING_SET.
+    let working_set_bytes = total_pixels.saturating_mul(4).saturating_add(cell_count.saturating_mul((std::mem::size_of::<DiffCell>() + 1) as u64));
+    if working_set_bytes > MAX_PIXELS_WORKING_SET {
+        return Err(ToolError::new(ErrorCode::OverLimit, format!("combined diff canvas is too large ({w}×{h})")));
+    }
+
+    let ssim = perceptual_similarity_rect(orig, built, PixelBox { x0: 0, y0: 0, x1: w, y1: h });
+    let lut = build_srgb_lut();
+    let mut cells = vec![DiffCell::default(); cell_count as usize];
+    let mut heatmap_rgba = vec![0u8; (total_pixels as usize).saturating_mul(4)];
+    let mut sum_de = 0.0f64;
+    let mut max_de = 0.0f64;
+    let mut differing_pixels = 0u64;
+    let thresh_f32 = opts.delta_e_threshold as f32;
+    let thresh_f64 = f64::from(thresh_f32);
+
+    for y in 0..h {
+        let row_i = (y as usize).saturating_mul(w as usize);
+        let cell_row = (y / DIFF_CELL_SIZE) as usize * (cols as usize);
+        let ly = (y % DIFF_CELL_SIZE) as u8;
+        let orig_in_y = y < orig.height;
+        let built_in_y = y < built.height;
+        let orig_row_base = (y as usize).saturating_mul(orig.width as usize).saturating_mul(4);
+        let built_row_base = (y as usize).saturating_mul(built.width as usize).saturating_mul(4);
+        for x in 0..w {
+            let pa = if orig_in_y && x < orig.width {
+                let o = orig_row_base.saturating_add((x as usize).saturating_mul(4));
+                orig.rgba.get(o..o + 4).map_or([0, 0, 0, 0], |p| [p[0], p[1], p[2], p[3]])
+            } else {
+                [0, 0, 0, 0]
+            };
+            let pb = if built_in_y && x < built.width {
+                let o = built_row_base.saturating_add((x as usize).saturating_mul(4));
+                built.rgba.get(o..o + 4).map_or([0, 0, 0, 0], |p| [p[0], p[1], p[2], p[3]])
+            } else {
+                [0, 0, 0, 0]
+            };
+            let ca = composite_over_mid_gray(pa);
+            let cb = composite_over_mid_gray(pb);
+            let de = if ca == cb {
+                0.0
+            } else {
+                let lab1 = linear_rgb_to_lab(lut[usize::from(ca[0])], lut[usize::from(ca[1])], lut[usize::from(ca[2])]);
+                let lab2 = linear_rgb_to_lab(lut[usize::from(cb[0])], lut[usize::from(cb[1])], lut[usize::from(cb[2])]);
+                delta_e_cie76(lab1, lab2)
+            };
+            let de_f32 = de as f32;
+            let de_measured = f64::from(de_f32);
+            sum_de += de_measured;
+            if de_measured > max_de {
+                max_de = de_measured;
+            }
+            if de_f32 > thresh_f32 {
+                differing_pixels += 1;
+                let cell_idx = cell_row.saturating_add((x / DIFF_CELL_SIZE) as usize);
+                if let Some(cell) = cells.get_mut(cell_idx) {
+                    cell.record((x % DIFF_CELL_SIZE) as u8, ly, de_f32, de_measured);
+                }
+            }
+            // Show desaturated built image for context; outside built's original bounds, show original context.
+            let src_rgb = if (!built_in_y || x >= built.width) && orig_in_y && x < orig.width { ca } else { cb };
+            let off = row_i.saturating_add(x as usize).saturating_mul(4);
+            if let Some(dst) = heatmap_rgba.get_mut(off..off + 4) {
+                dst.copy_from_slice(&blend_heatmap_pixel(src_rgb, de_f32, thresh_f32, thresh_f64));
+            }
+        }
+    }
+
+    let mean_delta_e = if total_pixels == 0 { 0.0 } else { sum_de / total_pixels as f64 };
+    let difference_fraction = if total_pixels == 0 { 0.0 } else { differing_pixels as f64 / total_pixels as f64 };
+    let regions = detect_diff_regions_from_cells(orig, built, (w, h), (cols, rows), &cells, ssim, opts);
+    drop(cells);
+
+    let mut heatmap_img = Image { width: w, height: h, rgba: heatmap_rgba };
+    draw_regions_and_badges(&mut heatmap_img, &regions);
+    let heatmap_png = encode_png(&heatmap_img)?;
+
+    let diff_json = json!({
+        "width": w,
+        "height": h,
+        "original_size": {"width": orig.width, "height": orig.height},
+        "built_size": {"width": built.width, "height": built.height},
+        "dimensions_matched": orig.width == built.width && orig.height == built.height,
+        "ssim": ssim,
+        "mean_delta_e": mean_delta_e,
+        "max_delta_e": max_de,
+        "total_pixels": total_pixels,
+        "differing_pixels": differing_pixels,
+        "difference_fraction": difference_fraction,
+        "delta_e_threshold": opts.delta_e_threshold,
+        "region_count": regions.len(),
+        "regions": regions,
+    });
+
+    Ok(PixelDiffReport {
+        width: w,
+        height: h,
+        original_width: orig.width,
+        original_height: orig.height,
+        built_width: built.width,
+        built_height: built.height,
+        ssim,
+        mean_delta_e,
+        max_delta_e: max_de,
+        total_pixels,
+        differing_pixels,
+        difference_fraction,
+        delta_e_threshold: opts.delta_e_threshold,
+        regions,
+        heatmap_png,
+        diff_json,
+    })
 }
 
 #[cfg(test)]
@@ -1652,6 +2480,211 @@ mod tests {
         assert_eq!(perceptual_similarity(&stripes, &img(100, 120, &|_, _| 0)), 0.0, "different sizes");
         let big = img(2000, 40, &|x, _| (x % 256) as u8);
         assert!(perceptual_similarity(&big, &big) > 0.999, "shrunk before comparing");
+    }
+
+    #[test]
+    fn cielab_conversion_and_delta_e_match_reference_colors() {
+        let black = rgb_to_lab(0, 0, 0);
+        assert!(black.0.abs() < 1e-6 && black.1.abs() < 1e-6 && black.2.abs() < 1e-6, "black: {black:?}");
+        let white = rgb_to_lab(255, 255, 255);
+        assert!((white.0 - 100.0).abs() < 0.05 && white.1.abs() < 0.05 && white.2.abs() < 0.05, "white: {white:?}");
+        let red = rgb_to_lab(255, 0, 0);
+        // D65 sRGB red is approximately L*=53.23, a*=80.11, b*=67.22.
+        assert!((red.0 - 53.23).abs() < 0.5 && red.1 > 75.0 && red.2 > 60.0, "red: {red:?}");
+        let blue = rgb_to_lab(0, 0, 255);
+        // D65 sRGB blue is approximately L*=32.30, a*=79.20, b*=-107.86.
+        assert!((blue.0 - 32.30).abs() < 0.5 && blue.2 < -100.0, "blue: {blue:?}");
+
+        assert!(delta_e_cie76(red, red).abs() < 1e-9);
+        assert!((delta_e_cie76(black, white) - 100.0).abs() < 0.1);
+        assert!(delta_e_cie76(red, blue) > 150.0);
+        // Subtle 2-unit sRGB shift produces a small perceptible Delta-E.
+        let subtle = delta_e_cie76(rgb_to_lab(120, 120, 120), rgb_to_lab(122, 120, 120));
+        assert!(subtle > 0.1 && subtle < 5.0, "subtle delta-e: {subtle}");
+    }
+
+    #[test]
+    fn pixel_diff_heatmap_clusters_merges_orders_and_filters_noise() {
+        let solid = |w: u32, h: u32, px: [u8; 4]| Image { width: w, height: h, rgba: (0..(w * h)).flat_map(|_| px).collect() };
+        let paint = |img: &mut Image, rx: u32, ry: u32, rw: u32, rh: u32, px: [u8; 4]| {
+            for y in ry..(ry + rh) {
+                for x in rx..(rx + rw) {
+                    let o = ((y * img.width + x) * 4) as usize;
+                    img.rgba[o..o + 4].copy_from_slice(&px);
+                }
+            }
+        };
+
+        // Identical images report SSIM 1.0, Delta-E 0.0, and zero regions.
+        let orig = solid(200, 160, [240, 240, 240, 255]);
+        let identical = compute_pixel_diff_heatmap(&orig, &orig, DiffOptions::default()).unwrap();
+        assert!((identical.ssim - 1.0).abs() < 1e-9);
+        assert!(identical.mean_delta_e.abs() < 1e-9);
+        assert_eq!(identical.differing_pixels, 0);
+        assert!(identical.regions.is_empty());
+        assert_eq!(png_dimensions(&identical.heatmap_png).unwrap(), (200, 160));
+
+        // Build image with:
+        // 1) Top-right pair of boxes separated by 12px (<= 16px, across inactive grid column 120..128) -> must merge into one box at y=16.
+        // 2) Bottom-left box far away -> must become Region [2] (ordered top-to-bottom, left-to-right).
+        // 3) Tiny 4x4 (16px < 32px) noise speckle -> must be filtered out from regions.
+        let mut built = solid(200, 160, [240, 240, 240, 255]);
+        paint(&mut built, 100, 16, 16, 16, [220, 20, 20, 255]);
+        paint(&mut built, 128, 16, 16, 16, [220, 20, 20, 255]); // 12px horizontal gap -> merged by 16px sweep!
+        paint(&mut built, 16, 100, 24, 24, [20, 40, 220, 255]); // 576px, well separated
+        paint(&mut built, 170, 140, 4, 4, [0, 0, 0, 255]); // 16px noise -> filtered out
+
+        let report = compute_pixel_diff_heatmap(&orig, &built, DiffOptions::default()).unwrap();
+        assert!(report.ssim < 1.0);
+        assert!(report.mean_delta_e > 0.0);
+        assert_eq!(report.differing_pixels, 16 * 16 * 2 + 24 * 24 + 16);
+        assert_eq!(report.regions.len(), 2, "expected 2 merged regions (noise dropped): {:?}", report.regions);
+
+        let r1 = &report.regions[0];
+        let r2 = &report.regions[1];
+        assert_eq!(r1.id, 1);
+        assert_eq!((r1.x, r1.y, r1.width, r1.height), (100, 16, 44, 16));
+        assert_eq!(r1.pixel_count, 512);
+        assert_eq!(r1.severity, "severe");
+        assert!(r1.mean_delta_e > 20.0);
+
+        // Fully transparent pixels (alpha == 0) with different hidden RGB values are normalized to the same composited background.
+        let trans_a = solid(32, 32, [255, 0, 0, 0]);
+        let trans_b = solid(32, 32, [0, 255, 120, 0]);
+        let trans_diff = compute_pixel_diff_heatmap(&trans_a, &trans_b, DiffOptions::default()).unwrap();
+        assert_eq!(trans_diff.differing_pixels, 0);
+        assert!(trans_diff.mean_delta_e.abs() < 1e-9);
+        assert!((trans_diff.ssim - 1.0).abs() < 1e-9);
+
+        // Opaque black vs transparent black must NOT score SSIM 1.0 (composited over neutral mid-gray).
+        let opaque_black = solid(24, 24, [0, 0, 0, 255]);
+        let trans_black = solid(24, 24, [0, 0, 0, 0]);
+        assert!(perceptual_similarity(&opaque_black, &trans_black) < 1.0);
+        let alpha_diff = compute_pixel_diff_heatmap(&opaque_black, &trans_black, DiffOptions::default()).unwrap();
+        assert!(alpha_diff.ssim < 1.0 && alpha_diff.differing_pixels == 24 * 24);
+        assert!(alpha_diff.regions.iter().all(|r| r.max_delta_e <= alpha_diff.max_delta_e));
+
+        // Low-opacity red vs blue (alpha = 1/255) contributes only 1/255 of full strength after compositing,
+        // while opaque red vs opaque blue remains strongly divergent.
+        let faint_red = solid(24, 24, [255, 0, 0, 1]);
+        let faint_blue = solid(24, 24, [0, 0, 255, 1]);
+        let faint_diff = compute_pixel_diff_heatmap(&faint_red, &faint_blue, DiffOptions::default()).unwrap();
+        assert!(faint_diff.regions.is_empty() && faint_diff.mean_delta_e < 2.5, "faint alpha diff: {}", faint_diff.mean_delta_e);
+        let full_red = solid(24, 24, [255, 0, 0, 255]);
+        let full_blue = solid(24, 24, [0, 0, 255, 255]);
+        let full_diff = compute_pixel_diff_heatmap(&full_red, &full_blue, DiffOptions::default()).unwrap();
+        assert_eq!(full_diff.regions.len(), 1);
+        assert_eq!(full_diff.regions[0].severity, "severe");
+
+        assert_eq!(r2.id, 2);
+        assert_eq!((r2.x, r2.y, r2.width, r2.height), (16, 100, 24, 24));
+        assert_eq!(r2.pixel_count, 576);
+        assert_eq!(r2.severity, "severe");
+
+        // JSON round-trip of DiffRegion works including &'static str severity.
+        let round_trip: Vec<DiffRegion> = serde_json::from_value(report.diff_json["regions"].clone()).unwrap();
+        assert_eq!(round_trip, report.regions);
+
+        // Heatmap PNG decodes cleanly and paints bright red box border on Region [1]'s top-left corner.
+        let hm = decode_png(&report.heatmap_png).unwrap();
+        assert_eq!((hm.width, hm.height), (200, 160));
+        let corner = ((r1.y * hm.width + r1.x) * 4) as usize;
+        assert!(
+            hm.rgba[corner] > 200 && hm.rgba[corner + 1] < 60 && hm.rgba[corner + 2] < 60,
+            "expected red border at corner: {:?}",
+            &hm.rgba[corner..corner + 4]
+        );
+
+        // Direct `render_diff_heatmap` produces identical RGBA output and draws white `[1]` glyph pixels on a red badge above Region [1].
+        let mut delta_matrix = vec![0.0f32; (orig.width * orig.height) as usize];
+        for (i, slot) in delta_matrix.iter_mut().enumerate() {
+            let o = i * 4;
+            let ca = composite_over_mid_gray([orig.rgba[o], orig.rgba[o + 1], orig.rgba[o + 2], orig.rgba[o + 3]]);
+            let cb = composite_over_mid_gray([built.rgba[o], built.rgba[o + 1], built.rgba[o + 2], built.rgba[o + 3]]);
+            if ca != cb {
+                *slot = delta_e_cie76(rgb_to_lab(ca[0], ca[1], ca[2]), rgb_to_lab(cb[0], cb[1], cb[2])) as f32;
+            }
+        }
+        let direct_hm = render_diff_heatmap(&orig, &built, &report.regions, &delta_matrix);
+        assert_eq!(direct_hm.rgba, hm.rgba, "render_diff_heatmap must match compute_pixel_diff_heatmap output");
+        let mut badge_red_px = 0usize;
+        let mut badge_white_px = 0usize;
+        for by in 0..r1.y {
+            for bx in r1.x..(r1.x + r1.width) {
+                let off = ((by * direct_hm.width + bx) * 4) as usize;
+                let px = [direct_hm.rgba[off], direct_hm.rgba[off + 1], direct_hm.rgba[off + 2], direct_hm.rgba[off + 3]];
+                if px == [220, 20, 20, 255] {
+                    badge_red_px += 1;
+                } else if px == [255, 255, 255, 255] {
+                    badge_white_px += 1;
+                }
+            }
+        }
+        assert!(
+            badge_red_px > 20 && badge_white_px > 10,
+            "expected red badge with white `[1]` glyph above Region [1]: red={badge_red_px}, white={badge_white_px}"
+        );
+
+        // Moderate (8 < mean_de <= 20, <= 500 px) and minor (2.5 < mean_de <= 8, <= 500 px) severity tiers.
+        let mut tier_img = solid(80, 40, [200, 200, 200, 255]);
+        paint(&mut tier_img, 4, 4, 8, 8, [175, 200, 200, 255]); // moderate shift (64 px)
+        paint(&mut tier_img, 44, 4, 8, 8, [192, 200, 200, 255]); // minor shift (64 px)
+        let tier_rep = compute_pixel_diff_heatmap(&solid(80, 40, [200, 200, 200, 255]), &tier_img, DiffOptions::default()).unwrap();
+        assert_eq!(tier_rep.regions.len(), 2, "{:?}", tier_rep.regions);
+        assert_eq!(tier_rep.regions[0].severity, "moderate");
+        assert_eq!(tier_rep.regions[1].severity, "minor");
+
+        // Dimension mismatch pads to common bounding dimensions and flags the missing strip as a region.
+        let taller = solid(200, 200, [240, 240, 240, 255]);
+        let padded = compute_pixel_diff_heatmap(&taller, &orig, DiffOptions::default()).unwrap();
+        assert_eq!((padded.width, padded.height), (200, 200));
+        assert_eq!(padded.diff_json["dimensions_matched"], false);
+        assert_eq!(padded.regions.len(), 1);
+        assert_eq!((padded.regions[0].x, padded.regions[0].y, padded.regions[0].width, padded.regions[0].height), (0, 160, 200, 40));
+
+        // Unmerged boxes sharing a grid cell column with merge_gap_px == 0 do not bleed pixel counts:
+        // a C-shaped region reaches x=18 (cell col 2) at top and bottom, while a separate 4×8 block
+        // sits in cell (2, 2) at x=20..24 (2px gap, unmerged when merge_gap_px == 0).
+        let base = solid(40, 40, [240, 240, 240, 255]);
+        let mut split = solid(40, 40, [240, 240, 240, 255]);
+        paint(&mut split, 0, 0, 18, 8, [220, 20, 20, 255]); // top bar: 144 px
+        paint(&mut split, 0, 8, 8, 24, [220, 20, 20, 255]); // left bar: 192 px
+        paint(&mut split, 0, 32, 18, 8, [220, 20, 20, 255]); // bottom bar: 144 px -> 480 px total
+        paint(&mut split, 20, 16, 4, 8, [20, 40, 220, 255]); // isolated block in cell (2, 2): 32 px
+        let split_opts = DiffOptions { merge_gap_px: 0, ..DiffOptions::default() };
+        let split_report = compute_pixel_diff_heatmap(&base, &split, split_opts).unwrap();
+        assert_eq!(split_report.regions.len(), 2, "{:?}", split_report.regions);
+        assert_eq!((split_report.regions[0].x, split_report.regions[0].y, split_report.regions[0].width, split_report.regions[0].height), (0, 0, 18, 40));
+        assert_eq!(split_report.regions[0].pixel_count, 480);
+        assert_eq!((split_report.regions[1].x, split_report.regions[1].y, split_report.regions[1].width, split_report.regions[1].height), (20, 16, 4, 8));
+        assert_eq!(split_report.regions[1].pixel_count, 32);
+    }
+
+    #[test]
+    fn full_page_1440x12000_diff_heatmap_succeeds_and_oversized_canvas_still_stops() {
+        // Default desktop full-page capture size (1440×12000) must fit within the working-set budget.
+        let (w, h) = (1440u32, 12_000u32);
+        let orig = Image { width: w, height: h, rgba: vec![240u8; (w as usize) * (h as usize) * 4] };
+        let mut built = Image { width: w, height: h, rgba: orig.rgba.clone() };
+        for y in 11_800..11_824u32 {
+            for x in 200..232u32 {
+                let o = ((y as usize) * (w as usize) + (x as usize)) * 4;
+                built.rgba[o..o + 4].copy_from_slice(&[220, 30, 30, 255]);
+            }
+        }
+        let report = compute_pixel_diff_heatmap(&orig, &built, DiffOptions::default()).unwrap();
+        assert_eq!((report.width, report.height), (w, h));
+        assert_eq!(report.differing_pixels, 32 * 24);
+        assert_eq!(report.regions.len(), 1, "{:?}", report.regions);
+        assert_eq!((report.regions[0].x, report.regions[0].y, report.regions[0].width, report.regions[0].height), (200, 11_800, 32, 24));
+        assert_eq!(png_dimensions(&report.heatmap_png).unwrap(), (w, h));
+
+        // Orthogonal inputs whose combined canvas exceeds MAX_PIXELS_WORKING_SET are still refused.
+        let wide = Image { width: 10_000, height: 16, rgba: vec![0u8; 10_000 * 16 * 4] };
+        let tall = Image { width: 16, height: 10_000, rgba: vec![0u8; 16 * 10_000 * 4] };
+        let err = compute_pixel_diff_heatmap(&wide, &tall, DiffOptions::default()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::OverLimit);
+        assert!(err.message.contains("10000×10000"), "{}", err.message);
     }
 }
 

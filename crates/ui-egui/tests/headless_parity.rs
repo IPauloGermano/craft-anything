@@ -126,7 +126,10 @@ const ACTIONS: &[Action] = &[
     a("pick_model_options",  "discover context and reasoning for a model",     Tool(&["ai_model_options_show"])),
     a("set_model_options",   "save a model's context and reasoning choices",   Tool(&["ai_model_options_set"])),
     a("choose_backend",      "pick the AI brain",                              Cli("chat <question> --backend")),
-    a("set_role",            "choose which AI builds or extracts",             Cli("ai extractor <name>")),
+    a("set_role",            "choose which AI builds, extracts or reviews",    Cli("ai extractor <name> / ai reviewer <name>")),
+    a("choose_reviewer",     "choose which AI reviews screenshots as a blind visual critic", Cli("ai reviewer <name>")),
+    a("pick_reviewer_model", "list the models the blind visual critic backend offers", Cli("ai model <name>")),
+    a("set_reviewer_model",  "choose a separate model for the blind visual critic", Cli("ai reviewer <name> --model")),
 
     // ---- Studying a target -------------------------------------------------------------------
     a("open_path",           "open an app or file as the target",              Tool(&["core_target_open"])),

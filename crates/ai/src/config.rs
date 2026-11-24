@@ -302,6 +302,10 @@ pub struct AiConfig {
     pub backends: Vec<BackendEntry>,
     /// Role (`lead`, `worker`, `reviewer`, `builder`) → backend name.
     pub roles: BTreeMap<String, String>,
+    /// Optional model override used exclusively by the blind visual critic (`Role::Reviewer`),
+    /// allowing a different model from the reviewer backend than the builder uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_model: Option<String>,
     /// Backends to try in order when one fails before answering.
     pub fallback_chain: Vec<String>,
     /// Price overrides by model id.
@@ -367,6 +371,9 @@ impl AiConfig {
     pub fn remove(&mut self, name: &str) -> bool {
         let before = self.backends.len();
         self.backends.retain(|b| b.config.name != name);
+        if self.roles.get(role_key(Role::Reviewer)).is_some_and(|v| v == name) {
+            self.reviewer_model = None;
+        }
         self.roles.retain(|_, v| v != name);
         self.fallback_chain.retain(|v| v != name);
         before != self.backends.len()
